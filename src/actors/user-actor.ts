@@ -155,9 +155,15 @@ export class UserActor implements Actor {
       return "debug";
     }
 
+    // Only route to auto-responder if it's enabled
+    const autoResponderEnabled = 
+      Deno.env.get("ENABLE_AUTO_RESPONDER") === "true" ||
+      Deno.env.get("NEVER_SLEEP") === "true";
+    
     if (
-      text.toLowerCase().includes("task") ||
-      text.toLowerCase().includes("todo")
+      autoResponderEnabled &&
+      (text.toLowerCase().includes("task") ||
+       text.toLowerCase().includes("todo"))
     ) {
       return "auto-responder";
     }

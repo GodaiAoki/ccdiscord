@@ -65,7 +65,6 @@ async function main() {
 
   // Create each Actor
   const userActor = new UserActor();
-  const autoResponderActor = new AutoResponderActor();
 
   // Select assistant Actor based on configuration
   let assistantActor;
@@ -87,7 +86,20 @@ async function main() {
 
   // Register Actors
   bus.register(userActor);
-  bus.register(autoResponderActor);
+  
+  // Conditionally register AutoResponder (opt-in)
+  const enableAutoResponder = 
+    Deno.env.get("ENABLE_AUTO_RESPONDER") === "true" ||
+    config.neverSleep;  // Enable with neverSleep for backward compatibility
+  
+  if (enableAutoResponder) {
+    const autoResponderActor = new AutoResponderActor();
+    bus.register(autoResponderActor);
+    console.log("[auto-responder] enabled");
+  } else {
+    console.log("[auto-responder] disabled");
+  }
+  
   bus.register(assistantActor);
 
   // Start all Actors

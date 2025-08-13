@@ -241,6 +241,16 @@ ${t("discord.instructions.header")}
       const assistantResponse = await this.messageBus.send(response);
 
       if (assistantResponse) {
+        // Filter out auto-responder messages if it's disabled
+        const autoResponderEnabled = 
+          Deno.env.get("ENABLE_AUTO_RESPONDER") === "true" ||
+          Deno.env.get("NEVER_SLEEP") === "true";
+        
+        if (assistantResponse.from === "auto-responder" && !autoResponderEnabled) {
+          console.log(`[${this.name}] Filtered auto-responder message (disabled)`);
+          return;
+        }
+        
         const text = (assistantResponse.payload as { text?: string })?.text;
         if (text) {
           // Avoid duplicate final send if streaming path already handled completion
