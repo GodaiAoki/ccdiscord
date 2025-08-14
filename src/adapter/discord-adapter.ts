@@ -251,6 +251,21 @@ ${t("discord.instructions.header")}
           return;
         }
         
+        // Filter out Claude Code's "Todos" tool output noise
+        const payload: any = assistantResponse.payload ?? {};
+        const txt = (payload.text ?? "").toString();
+        const toolName = payload.toolName || payload.tool || "";
+        const looksLikeTodos =
+          /Todos have been modified successfully/i.test(txt) ||
+          /continue to use the todo list/i.test(txt) ||
+          /ensure that you continue to use the todo list/i.test(txt) ||
+          /^Todos$/i.test(toolName);
+        
+        if (looksLikeTodos) {
+          console.log(`[${this.name}] Suppressed Todos tool output`);
+          return;
+        }
+        
         const text = (assistantResponse.payload as { text?: string })?.text;
         if (text) {
           // Avoid duplicate final send if streaming path already handled completion
