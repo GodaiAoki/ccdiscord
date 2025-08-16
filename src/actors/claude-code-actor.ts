@@ -12,6 +12,8 @@ export class ClaudeCodeActor implements Actor {
   name: string;
   private adapter: ClaudeCodeAdapter;
   private bus?: MessageBus;
+  private queue: ActorMessage[] = [];
+  private running = false;
 
   constructor(config: Config, name = "claude-code") {
     this.name = name;
@@ -52,6 +54,28 @@ export class ClaudeCodeActor implements Actor {
   }
 
   async handleMessage(message: ActorMessage): Promise<ActorResponse | null> {
+    // Queue message and process serially to avoid race conditions
+    this.queue.push(message);
+    
+    if (this.running) {
+      return null; // Already processing, will be handled in queue
+    }
+    
+    this.running = true;
+    
+    try {
+      while (this.queue.length > 0) {
+        const nextMessage = this.queue.shift()!;
+        await this.processMessage(nextMessage);
+      }
+    } finally {
+      this.running = false;
+    }
+    
+    return null; // Response is handled asynchronously via streaming
+  }
+
+  private async processMessage(message: ActorMessage): Promise<void> {
     console.log(`[${this.name}] Processing message with Claude Code`);
 
     const content = message.payload as {
@@ -64,12 +88,16 @@ export class ClaudeCodeActor implements Actor {
     const channelId = content.channelId;
 
     if (!text) {
-      return this.createResponse(
-        message.from,
-        "error",
-        { error: "No text provided for Claude" },
-        message.id
-      );
+      // Send error response via bus if available
+      if (this.bus) {
+        await this.bus.send(this.createResponse(
+          message.from,
+          "error",
+          { error: "No text provided for Claude" },
+          message.id
+        ));
+      }
+      return;
     }
 
     // ストリーミング有効判定（bus 未注入や無効時は従来どおり最終のみ）
@@ -81,21 +109,26 @@ export class ClaudeCodeActor implements Actor {
     if (!canStream) {
       try {
         const response = await this.adapter.query(text);
-        return this.createResponse(
-          message.from,
-          "claude-response",
-          { text: response, sessionId: this.adapter.getCurrentSessionId() },
-          message.id
-        );
+        if (this.bus) {
+          await this.bus.send(this.createResponse(
+            message.from,
+            "claude-response",
+            { text: response, sessionId: this.adapter.getCurrentSessionId() },
+            message.id
+          ));
+        }
       } catch (error) {
         console.error(`[${this.name}] Error querying Claude:`, error);
-        return this.createResponse(
-          message.from,
-          "error",
-          { error: error instanceof Error ? error.message : "Unknown error" },
-          message.id
-        );
+        if (this.bus) {
+          await this.bus.send(this.createResponse(
+            message.from,
+            "error",
+            { error: error instanceof Error ? error.message : "Unknown error" },
+            message.id
+          ));
+        }
       }
+      return;
     }
 
     // ストリーミング経路
@@ -232,12 +265,14 @@ export class ClaudeCodeActor implements Actor {
         // ignore
       }
 
-      return this.createResponse(
-        message.from,
-        "error",
-        { error: error instanceof Error ? error.message : "Unknown error" },
-        message.id
-      );
+      if (this.bus) {
+        await this.bus.send(this.createResponse(
+          message.from,
+          "error",
+          { error: error instanceof Error ? error.message : "Unknown error" },
+          message.id
+        ));
+      }
     }
   }
 

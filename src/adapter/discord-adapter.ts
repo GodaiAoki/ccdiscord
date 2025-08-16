@@ -241,6 +241,31 @@ ${t("discord.instructions.header")}
       const assistantResponse = await this.messageBus.send(response);
 
       if (assistantResponse) {
+        // Filter out auto-responder messages if it's disabled
+        const autoResponderEnabled = 
+          Deno.env.get("ENABLE_AUTO_RESPONDER") === "true" ||
+          Deno.env.get("NEVER_SLEEP") === "true";
+        
+        if (assistantResponse.from === "auto-responder" && !autoResponderEnabled) {
+          console.log(`[${this.name}] Filtered auto-responder message (disabled)`);
+          return;
+        }
+        
+        // Filter out Claude Code's "Todos" tool output noise
+        const payload: any = assistantResponse.payload ?? {};
+        const txt = (payload.text ?? "").toString();
+        const toolName = payload.toolName || payload.tool || "";
+        const looksLikeTodos =
+          /Todos have been modified successfully/i.test(txt) ||
+          /continue to use the todo list/i.test(txt) ||
+          /ensure that you continue to use the todo list/i.test(txt) ||
+          /^Todos$/i.test(toolName);
+        
+        if (looksLikeTodos) {
+          console.log(`[${this.name}] Suppressed Todos tool output`);
+          return;
+        }
+        
         const text = (assistantResponse.payload as { text?: string })?.text;
         if (text) {
           // Avoid duplicate final send if streaming path already handled completion

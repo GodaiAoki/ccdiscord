@@ -230,6 +230,91 @@ ccdiscord/
 
 **注意**: Claude Code は内部認証を使用します。`ANTHROPIC_API_KEY` を設定しないでください。
 
+## 運用上の注意事項
+
+### メッセージ出力の最適化
+
+Claude Code の内部ツール（TodoWrite）により、以下のような中間メッセージが表示される場合があります：
+
+```
+📋 Tool execution result:
+Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress.
+```
+
+これらのメッセージは正常な動作の一部ですが、出力量を抑制するために以下の運用方法を推奨します：
+
+#### 推奨する依頼の仕方
+
+1. **具体的で直接的な依頼**
+   ```
+   ❌ 避ける: "ステップバイステップでTodoアプリを作成してください"
+   ✅ 推奨: "index.htmlをTodoアプリに上書きしてください。必要ならtodo.jsも作成してください"
+   ```
+
+2. **一度に一つのタスク**
+   ```
+   ❌ 避ける: 複数のタスクを同時に依頼し、「続けて」で追加要求
+   ✅ 推奨: タスクの完了（✅）を待ってから次の依頼
+   ```
+
+3. **計画系の単語を避ける**
+   - 「ステップバイステップ」
+   - 「Todoリスト」
+   - 「計画を立てて」
+   
+   これらの単語はClaude Codeの内部プランナーを起動し、中間メッセージが増える原因となります。
+
+#### 設定による出力抑制（任意）
+
+より静かな動作を希望する場合は、環境変数で設定できます：
+
+```bash
+# .env ファイルに追加
+CLAUDE_TOOL_VERBOSE=false
+SUPPRESS_TODOS_OUTPUT=true
+```
+
+#### AutoResponder の制御
+
+このフォーク版では、AutoResponderは既定で無効化されています。有効にしたい場合：
+
+```bash
+# Never Sleep モード（自動タスク実行）を有効化
+ENABLE_AUTO_RESPONDER=true
+NEVER_SLEEP=true
+```
+
+### Docker/Devcontainer 環境での注意事項
+
+Docker環境で実行する場合の追加設定：
+
+1. **権限設定**
+   ```bash
+   # 非インタラクティブ運用には必須
+   CLAUDE_PERMISSION_MODE=bypassPermissions
+   ```
+
+2. **Denoのインストール**
+   ```dockerfile
+   # Dockerfile で Deno を追加
+   RUN curl -fsSL https://deno.land/install.sh | sh && \
+       mv /root/.deno/bin/deno /usr/local/bin/deno
+   ```
+
+3. **Claude Code CLI のインストール**
+   ```json
+   // devcontainer.json
+   "postCreateCommand": "npm i -g @anthropic-ai/claude-code"
+   ```
+
+### トラブルシューティング
+
+| 問題 | 原因 | 解決方法 |
+|------|------|----------|
+| 前タスクの完了メッセージが繰り返し表示される | AutoResponderが有効 | `.env`から`ENABLE_AUTO_RESPONDER=true`を削除 |
+| Todosメッセージが大量に出力される | 計画系の依頼文 | 具体的で直接的な依頼文に変更 |
+| `!reset`後も古い情報が残る | セッション状態の不整合 | `!stop` → `!reset` → 新しい依頼 |
+
 ## セキュリティ注意事項
 
 このボットは強力な権限を持ち、コマンドを実行します。信頼できる環境でのみ、注意して使用してください。
