@@ -17,8 +17,13 @@ import { DebugActor } from "./actors/debug-actor.ts";
 import { AutoResponderActor } from "./actors/auto-responder-actor.ts";
 import { DiscordAdapter } from "./adapter/discord-adapter.ts";
 import type { ActorMessage } from "./types.ts";
+import { applyDenoWebSocketShim } from "./utils/deno-ws-shim.ts";
 
 async function main() {
+  // Deno WebSocket互換性対策（Discord.jsより前に実行）
+  if (typeof Deno !== "undefined") {
+    await applyDenoWebSocketShim();
+  }
   // Parse CLI options
   const options = parseCliOptions();
 

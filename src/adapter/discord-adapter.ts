@@ -9,6 +9,12 @@ import type { Adapter, MessageBus, ActorMessage } from "../types.ts";
 import type { Config } from "../config.ts";
 import { t } from "../i18n.ts";
 import { AuditLogger } from "../utils/audit-logger.ts";
+import { DiscordDiagnostics } from "../utils/discord-diagnostics.ts";
+import { 
+  withRetry, 
+  ConnectionStateManager, 
+  SessionPersistence 
+} from "../utils/resilient-connection.ts";
 
 // Adapter that manages Discord connection
 export class DiscordAdapter implements Adapter {
@@ -19,6 +25,9 @@ export class DiscordAdapter implements Adapter {
   private currentThread: ThreadChannel | null = null;
   private isRunning = false;
   private auditLogger: AuditLogger;
+  private diagnostics?: DiscordDiagnostics;
+  private connectionManager: ConnectionStateManager;
+  private sessionPersistence?: SessionPersistence;
   // Streaming state: originalMessageId -> buffers and timer
   private streamStates: Map<
     string,
@@ -38,6 +47,12 @@ export class DiscordAdapter implements Adapter {
     this.config = config;
     this.messageBus = messageBus;
     this.auditLogger = new AuditLogger();
+    this.connectionManager = new ConnectionStateManager();
+    
+    // セッション永続化（continueオプション用）
+    if (config.sessionId) {
+      this.sessionPersistence = new SessionPersistence(config.sessionId);
+    }
 
     this.client = new Client({
       intents: [
@@ -59,6 +74,14 @@ export class DiscordAdapter implements Adapter {
 
     try {
       await this.auditLogger.init();
+      
+      // 診断機能を有効化
+      const enableDiagnostics = Deno.env.get("DISCORD_DIAGNOSTICS") !== "false";
+      if (enableDiagnostics) {
+        console.log(`[${this.name}] Diagnostics enabled`);
+        this.diagnostics = new DiscordDiagnostics(this.client);
+      }
+      
       await this.client.login(this.config.discordToken);
       this.isRunning = true;
       await this.auditLogger.logSessionStart(this.config.sessionId || "default", Deno.cwd());
@@ -80,6 +103,11 @@ export class DiscordAdapter implements Adapter {
     }
 
     await this.auditLogger.logSessionEnd(this.config.sessionId || "default");
+
+    // 診断機能を停止
+    if (this.diagnostics) {
+      this.diagnostics.stop();
+    }
 
     // Unsubscribe listener and clear timers
     if (this.busListener) {
