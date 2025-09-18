@@ -136,6 +136,31 @@ export class DiscordAdapter implements Adapter {
     this.client.once("ready", () => this.handleReady());
     this.client.on("messageCreate", (message) => this.handleMessage(message));
     this.client.on("error", (error) => this.handleError(error));
+
+    // Gateway raw パケットの処理（invalid_session 対応）
+    this.client.on("raw", async (packet: any) => {
+      if (packet?.op === 9) {
+        // OP 9: Invalid Session
+        const resumable = !!packet?.d;
+        console.warn(`[gw] invalid_session detected (resumable=${resumable})`);
+
+        if (!resumable) {
+          // Resume不可能な場合、ランダム待機後に再接続
+          const waitTime = 1000 + Math.floor(Math.random() * 4000); // 1-5秒
+          console.log(`[gw] Waiting ${waitTime}ms before reconnecting...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+
+          try {
+            await this.client.destroy();
+            console.log(`[gw] Destroyed old client, attempting to re-login...`);
+            await this.client.login(this.config.discordToken);
+            console.log(`[gw] Successfully re-authenticated`);
+          } catch (error) {
+            console.error(`[gw] Failed to re-authenticate:`, error);
+          }
+        }
+      }
+    });
   }
 
   private async handleReady(): Promise<void> {
@@ -165,7 +190,11 @@ export class DiscordAdapter implements Adapter {
 
       // Send initial message
       const initialMessage = this.createInitialMessage();
-      await this.currentThread.send(initialMessage);
+      await withRetry(
+        () => this.currentThread!.send(initialMessage),
+        "thread.send.initial",
+        { maxRetries: 3, initialDelay: 1000 }
+      );
 
       console.log(`[${this.name}] ${t("discord.threadCreated")} ${threadName}`);
     } catch (error) {
@@ -210,7 +239,11 @@ ${t("discord.instructions.header")}
       // Log auth failure
       await this.auditLogger.logAuthFailure(message.author.id, message.channel.id);
       // Send warning message if user is not allowed
-      await message.reply(t("discord.userNotAllowed") || "You are not authorized to use this bot.");
+      await withRetry(
+        () => message.reply(t("discord.userNotAllowed") || "You are not authorized to use this bot."),
+        "message.reply.auth",
+        { maxRetries: 2, initialDelay: 500 }
+      );
       return;
     }
 
@@ -321,15 +354,27 @@ ${t("discord.instructions.header")}
 
     switch (response.type) {
       case "reset-session":
-        await channel.send(t("discord.commands.resetComplete"));
+        await withRetry(
+          () => channel.send(t("discord.commands.resetComplete")),
+          "channel.send.reset",
+          { maxRetries: 3, initialDelay: 1000 }
+        );
         break;
 
       case "stop-tasks":
-        await channel.send(t("discord.commands.stopComplete"));
+        await withRetry(
+          () => channel.send(t("discord.commands.stopComplete")),
+          "channel.send.stop",
+          { maxRetries: 3, initialDelay: 1000 }
+        );
         break;
 
       case "shutdown":
-        await channel.send(t("discord.commands.exitMessage"));
+        await withRetry(
+          () => channel.send(t("discord.commands.exitMessage")),
+          "channel.send.exit",
+          { maxRetries: 2, initialDelay: 500 }
+        );
         await this.stop();
         Deno.exit(0);
 
@@ -340,8 +385,12 @@ ${t("discord.instructions.header")}
         // - Validate and sanitize all inputs
         // - Run commands in a sandboxed environment
         // - Log all command executions for audit purposes
-        await channel.send(
-          "⚠️ Shell command execution is disabled for security reasons."
+        await withRetry(
+          () => channel.send(
+            "⚠️ Shell command execution is disabled for security reasons."
+          ),
+          "channel.send.shell-warning",
+          { maxRetries: 2, initialDelay: 500 }
         );
         break;
     }
@@ -370,7 +419,11 @@ ${t("discord.instructions.header")}
 
     for (const msg of messages) {
       try {
-        await channel.send(msg);
+        await withRetry(
+          () => channel.send(msg),
+          "channel.send.long-message",
+          { maxRetries: 3, initialDelay: 1000 }
+        );
         // Wait a bit to avoid rate limiting
         await new Promise((resolve) => setTimeout(resolve, 1000));
       } catch (error) {
@@ -465,7 +518,11 @@ ${t("discord.instructions.header")}
     };
     if (cfg.showThinking && this.currentThread?.sendable) {
       try {
-        const msg = await this.currentThread.send("🤔 考え中...");
+        const msg = await withRetry(
+          () => this.currentThread!.send("🤔 考え中..."),
+          "thread.send.thinking",
+          { maxRetries: 2, initialDelay: 500 }
+        );
         state.thinkingMessage = msg;
       } catch (e) {
         console.error(`[${this.name}] failed to post thinking message`, e);
@@ -495,10 +552,18 @@ ${t("discord.instructions.header")}
 
     try {
       if (st.mode === "edit" && st.thinkingMessage) {
-        await st.thinkingMessage.edit(this.capContent(out));
+        await withRetry(
+          () => st.thinkingMessage!.edit(this.capContent(out)),
+          "message.edit.stream",
+          { maxRetries: 3, initialDelay: 1000 }
+        );
       } else {
         // append mode or no thinking message available
-        await this.currentThread.send(this.capContent(out));
+        await withRetry(
+          () => this.currentThread!.send(this.capContent(out)),
+          "thread.send.stream",
+          { maxRetries: 3, initialDelay: 1000 }
+        );
       }
     } catch (e) {
       console.error(`[${this.name}] stream flush error`, e);
@@ -553,7 +618,11 @@ ${t("discord.instructions.header")}
 
     for (const msg of messages) {
       try {
-        await this.currentThread.send(msg);
+        await withRetry(
+          () => this.currentThread!.send(msg),
+          "thread.send.completed",
+          { maxRetries: 3, initialDelay: 1000 }
+        );
         // Wait to avoid rate limiting (keep parity with sendLongMessage)
         await new Promise((resolve) => setTimeout(resolve, 1000));
       } catch (error) {
@@ -596,7 +665,11 @@ ${t("discord.instructions.header")}
         await this.sendLongToCurrentThread(fullText);
       }
       if (cfg.showDone && this.currentThread) {
-        await this.currentThread.send("✅ done");
+        await withRetry(
+          () => this.currentThread!.send("✅ done"),
+          "thread.send.done",
+          { maxRetries: 2, initialDelay: 500 }
+        );
       }
     } catch (e) {
       console.error(`[${this.name}] failed to send final output`, e);
@@ -629,7 +702,11 @@ ${t("discord.instructions.header")}
     const cfg = this.getStreamingConfig();
     if (cfg.showAbort && this.currentThread) {
       try {
-        await this.currentThread.send(`⚠️ ストリーミング中断: ${message}`);
+        await withRetry(
+          () => this.currentThread!.send(`⚠️ ストリーミング中断: ${message}`),
+          "thread.send.abort",
+          { maxRetries: 2, initialDelay: 500 }
+        );
       } catch {
         // ignore
       }

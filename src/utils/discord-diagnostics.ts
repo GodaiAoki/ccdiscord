@@ -1,47 +1,41 @@
 import { Client } from "discord.js";
 
 export class DiscordDiagnostics {
-  private lastHeartbeatSent = 0;
-  private lastHeartbeatAck = 0;
   private loopCheckInterval?: number;
   private enabled = true;
+  private pingInterval?: number;
 
   constructor(private client: Client) {
     this.setupDiagnostics();
   }
 
   private setupDiagnostics(): void {
-    // WebSocket接続状態の監視
-    this.client.ws.on("debug", (info) => {
+    // Client レベルのイベント（discord.js v14 推奨方式）
+    this.client.on("debug", (info: string) => {
       if (this.enabled) {
         console.debug(`[gw-debug] ${info}`);
       }
     });
 
     // シャード切断イベント
-    this.client.ws.on("shardDisconnect" as any, (ev: any, shardId: number) => {
+    this.client.on("shardDisconnect" as any, (event: any, shardId: number) => {
       console.warn(
-        `[shard ${shardId}] disconnect code=${ev?.code} reason=${ev?.reason ?? ""} wasClean=${ev?.wasClean}`
+        `[shard ${shardId}] disconnect code=${event?.code} reason=${event?.reason ?? ""} wasClean=${event?.wasClean}`
       );
     });
 
     // シャード再接続イベント
-    this.client.ws.on("shardResume" as any, (shardId: number, replayed: number) => {
-      console.log(`[shard ${shardId}] resumed (${replayed} events replayed)`);
+    this.client.on("shardResume" as any, (shardId: number, replayedEvents: number) => {
+      console.log(`[shard ${shardId}] resumed (${replayedEvents} events replayed)`);
     });
 
     // シャード準備完了
-    this.client.ws.on("shardReady" as any, (shardId: number) => {
+    this.client.on("shardReady" as any, (shardId: number) => {
       console.log(`[shard ${shardId}] ready`);
     });
 
-    // ハートビート送信の監視
-    this.client.ws.on("shardPing" as any, (ping: number, shardId: number) => {
-      console.log(`[hb] shard ${shardId} ping=${ping}ms`);
-    });
-
-    // エラーハンドリング
-    this.client.ws.on("shardError" as any, (error: Error, shardId: number) => {
+    // エラーハンドリング（Client レベル）
+    this.client.on("shardError" as any, (error: Error, shardId: number) => {
       console.error(`[shard ${shardId}] error:`, error.message);
       // TypeError対策: errorオブジェクトの詳細確認
       if (error.message?.includes("Cannot use 'in' operator")) {
@@ -49,23 +43,48 @@ export class DiscordDiagnostics {
       }
     });
 
+    // Ping監視（定期的にチェック）
+    this.pingInterval = setInterval(() => {
+      if (this.client.ws.ping > 0) {
+        console.log(`[hb] ping=${this.client.ws.ping}ms`);
+      }
+    }, 10000) as unknown as number;
+
     // イベントループ遅延の監視
     this.startLoopMonitoring();
   }
 
   private startLoopMonitoring(): void {
     let lastCheck = Date.now();
-    
+    let consecutiveLags = 0;
+
     this.loopCheckInterval = setInterval(() => {
       const now = Date.now();
       const expectedDelta = 1000;
       const actualDelta = now - lastCheck;
       const lag = actualDelta - expectedDelta;
-      
-      if (lag > 250) {
-        console.warn(`[loop] Event loop lag detected: ${lag}ms`);
+
+      // サスペンド復帰時の誤検知を防ぐ
+      if (lag > 5000) {
+        // 5秒以上の遅延は、おそらくプロセスのサスペンド
+        console.warn(`[loop] Process was suspended for ~${Math.round(lag/1000)}s`);
+        lastCheck = now;
+        consecutiveLags = 0;
+        return;
       }
-      
+
+      if (lag > 250) {
+        consecutiveLags++;
+        console.warn(`[loop] Event loop lag detected: ${lag}ms (consecutive: ${consecutiveLags})`);
+
+        // 連続して遅延が発生している場合のみ警告
+        if (consecutiveLags > 3) {
+          console.error(`[loop] Persistent event loop blocking detected!`);
+        }
+      } else {
+        consecutiveLags = 0;
+      }
+
       lastCheck = now;
     }, 1000) as unknown as number;
   }
@@ -74,6 +93,9 @@ export class DiscordDiagnostics {
     this.enabled = false;
     if (this.loopCheckInterval) {
       clearInterval(this.loopCheckInterval);
+    }
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
     }
   }
 
