@@ -1,5 +1,8 @@
 import { Client, GatewayIntentBits, Message, TextChannel, ThreadChannel } from "discord.js";
-import type { ActorMessage, Adapter, MessageBus } from "../types.ts";
+import type { Attachment } from "discord.js";
+import { ensureDir } from "@std/fs";
+import { join } from "@std/path";
+import type { ActorMessage, Adapter, ImportedAttachment, MessageBus } from "../types.ts";
 import type { Config } from "../config.ts";
 import { t } from "../i18n.ts";
 import { AuditLogger } from "../utils/audit-logger.ts";
@@ -9,6 +12,91 @@ import {
   SessionPersistence,
   withRetry,
 } from "../utils/resilient-connection.ts";
+
+const ATTACHMENTS_ENABLED = (Deno.env.get("CCDISCORD_ATTACH_ENABLE") ?? "true").toLowerCase() !==
+  "false";
+const MAX_TEXT_BYTES = parseEnvNumber("CCDISCORD_ATTACH_MAX_TEXT_BYTES", 1_000_000);
+const PREVIEW_BYTES = parseEnvNumber("CCDISCORD_ATTACH_INLINE_PREVIEW_BYTES", 8_000);
+const ATTACH_BASE_DIR = Deno.env.get("CCDISCORD_ATTACH_BASEDIR");
+const DISCORD_CDN_REGEX = /^https:\/\/(cdn|media)\.discord(app)?\.com\//i;
+const TEXT_EXTENSIONS = new Set([
+  ".txt",
+  ".md",
+  ".markdown",
+  ".json",
+  ".yaml",
+  ".yml",
+  ".csv",
+  ".tsv",
+  ".py",
+  ".js",
+  ".ts",
+  ".tsx",
+  ".jsx",
+  ".html",
+  ".htm",
+  ".css",
+  ".scss",
+  ".c",
+  ".cc",
+  ".cpp",
+  ".h",
+  ".hpp",
+  ".java",
+  ".kt",
+  ".go",
+  ".rs",
+  ".rb",
+  ".php",
+  ".swift",
+  ".sql",
+  ".xml",
+  ".ini",
+  ".toml",
+  ".conf",
+  ".cfg",
+  ".sh",
+  ".bash",
+  ".zsh",
+  ".ps1",
+]);
+
+function parseEnvNumber(key: string, fallback: number): number {
+  const raw = Deno.env.get(key);
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return parsed;
+}
+
+function extensionOf(filename: string): string {
+  const idx = filename.lastIndexOf(".");
+  return idx >= 0 ? filename.slice(idx).toLowerCase() : "";
+}
+
+function isLikelyText(filename: string, contentType?: string | null): boolean {
+  if (contentType) {
+    const lowered = contentType.toLowerCase();
+    if (lowered.startsWith("text/")) return true;
+    if (lowered.includes("json") || lowered.includes("xml") || lowered.includes("yaml")) {
+      return true;
+    }
+  }
+  return TEXT_EXTENSIONS.has(extensionOf(filename));
+}
+
+function sanitizeFilename(name: string): string {
+  const trimmed = name.trim() || "attachment";
+  const replaced = trimmed.replace(/[^\w.\-+@]+/g, "_");
+  return replaced.slice(0, 120) || "attachment";
+}
+
+function resolveAttachmentDir(channelId: string): string {
+  const base = ATTACH_BASE_DIR
+    ? (ATTACH_BASE_DIR.startsWith("/") ? ATTACH_BASE_DIR : join(Deno.cwd(), ATTACH_BASE_DIR))
+    : join(Deno.cwd(), "attachments");
+  return join(base, channelId);
+}
 
 // Adapter that manages Discord connection
 export class DiscordAdapter implements Adapter {
@@ -215,6 +303,91 @@ ${t("discord.instructions.header")}
 - ${t("discord.instructions.normalMessage")}`;
   }
 
+  private async collectAttachments(message: Message): Promise<ImportedAttachment[]> {
+    if (!ATTACHMENTS_ENABLED) return [];
+    const raw = message.attachments;
+    if (!raw || raw.size === 0) return [];
+
+    const collected: ImportedAttachment[] = [];
+    for (const attachment of raw.values()) {
+      try {
+        const saved = await this.saveAttachment(message.channel.id, attachment);
+        if (saved) collected.push(saved);
+      } catch (error) {
+        console.error(`[${this.name}] Failed to persist attachment`, error);
+      }
+    }
+    return collected;
+  }
+
+  private async saveAttachment(
+    channelId: string,
+    attachment: Attachment,
+  ): Promise<ImportedAttachment | null> {
+    const url = attachment.url ?? attachment.proxyURL ?? null;
+    if (!url || !DISCORD_CDN_REGEX.test(url)) {
+      return null;
+    }
+
+    const filename = attachment.name ?? "attachment";
+    const sanitized = sanitizeFilename(filename);
+    const contentType = attachment.contentType ?? undefined;
+    const isText = isLikelyText(filename, contentType ?? null);
+    if (!isText) {
+      return null;
+    }
+
+    const sizeHint = typeof attachment.size === "number" ? attachment.size : 0;
+    if (sizeHint && sizeHint > MAX_TEXT_BYTES) {
+      console.warn(
+        `[${this.name}] Skipped attachment ${filename} (${sizeHint} bytes), exceeds text limit`,
+      );
+      return null;
+    }
+
+    const dir = resolveAttachmentDir(channelId);
+    await ensureDir(dir);
+    const storedPath = join(dir, `${Date.now()}_${sanitized}`);
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Attachment fetch failed with status ${response.status}`);
+    }
+
+    const buffer = new Uint8Array(await response.arrayBuffer());
+    if (buffer.byteLength > MAX_TEXT_BYTES) {
+      console.warn(
+        `[${this.name}] Skipped attachment ${filename} after download; size ${buffer.byteLength} bytes`,
+      );
+      return null;
+    }
+
+    await Deno.writeFile(storedPath, buffer);
+
+    const cwd = Deno.cwd();
+    let displayPath = storedPath;
+    if (storedPath.startsWith(`${cwd}/`)) {
+      displayPath = storedPath.slice(cwd.length + 1);
+    } else if (storedPath.startsWith(`${cwd}\\`)) {
+      displayPath = storedPath.slice(cwd.length + 1);
+    }
+
+    let preview: string | undefined;
+    if (buffer.byteLength > 0) {
+      const slice = buffer.subarray(0, Math.min(PREVIEW_BYTES, buffer.byteLength));
+      preview = new TextDecoder("utf-8", { fatal: false }).decode(slice);
+    }
+
+    return {
+      filename,
+      path: displayPath,
+      size: buffer.byteLength,
+      contentType,
+      isText,
+      contentPreview: preview,
+    };
+  }
+
   private async handleMessage(message: Message): Promise<void> {
     // Ignore own messages and messages from other bots
     if (message.author.bot) return;
@@ -239,11 +412,6 @@ ${t("discord.instructions.header")}
     }
 
     const content = message.content.trim();
-    if (!content) return;
-
-    console.log(
-      `[${this.name}] ${t("discord.receivedMessage")} ${message.author.username}: ${content}`,
-    );
 
     if (content === "!retry") {
       await this.messageBus.send({
@@ -261,12 +429,29 @@ ${t("discord.instructions.header")}
       return;
     }
 
+    let attachments: ImportedAttachment[] = [];
+    try {
+      attachments = await this.collectAttachments(message);
+    } catch (error) {
+      console.error(`[${this.name}] Attachment collection failed`, error);
+    }
+
+    const logSummary = content || (attachments.length > 0 ? "[attachments]" : "");
+
+    if (!logSummary) {
+      return;
+    }
+
+    console.log(
+      `[${this.name}] ${t("discord.receivedMessage")} ${message.author.username}: ${logSummary}`,
+    );
+
     // Log user message
     await this.auditLogger.logUserMessage(
       message.author.id,
       message.author.username,
       message.channel.id,
-      content,
+      logSummary,
     );
 
     // Convert Discord message to ActorMessage
@@ -279,6 +464,7 @@ ${t("discord.instructions.header")}
         text: content,
         authorId: message.author.id,
         channelId: message.channel.id,
+        attachments,
       },
       timestamp: new Date(),
     };

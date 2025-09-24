@@ -1,4 +1,10 @@
-import type { Actor, ActorMessage, ActorResponse, MessageBus } from "../types.ts";
+import type {
+  Actor,
+  ActorMessage,
+  ActorResponse,
+  ImportedAttachment,
+  MessageBus,
+} from "../types.ts";
 import { ClaudeCodeAdapter } from "../adapter/claude-code-adapter.ts";
 import type { Config } from "../config.ts";
 
@@ -13,6 +19,8 @@ type ClaudeErrorKind =
   | "NETWORK"
   | "CLI_NOT_FOUND"
   | "UNKNOWN";
+
+const ATTACHMENT_PREVIEW_CHAR_LIMIT = 4000;
 
 // Actor that communicates with ClaudeCode API
 export class ClaudeCodeActor implements Actor {
@@ -108,8 +116,10 @@ export class ClaudeCodeActor implements Actor {
       text?: string;
       originalMessageId?: string;
       channelId?: string;
+      attachments?: ImportedAttachment[];
     };
-    const text = content.text;
+    const text = content.text ?? "";
+    const attachments = content.attachments ?? [];
     const originalMessageId = content.originalMessageId ?? message.id;
     const channelId = content.channelId;
 
@@ -124,7 +134,7 @@ export class ClaudeCodeActor implements Actor {
       });
     }
 
-    if (!text) {
+    if (!text && attachments.length === 0) {
       // Send error response via bus if available
       if (this.bus) {
         await this.bus.send(this.createResponse(
@@ -137,6 +147,8 @@ export class ClaudeCodeActor implements Actor {
       return;
     }
 
+    const mergedText = this.buildMessageContent(text, attachments);
+
     // ストリーミング有効判定（bus 未注入や無効時は従来どおり最終のみ）
     const streamingEnabled = (this as any).adapter &&
       ((this as any).adapter["config"]?.streamingEnabled ?? true);
@@ -144,7 +156,7 @@ export class ClaudeCodeActor implements Actor {
 
     if (!canStream) {
       try {
-        const response = await this.adapter.query(text);
+        const response = await this.adapter.query(mergedText);
         if (this.bus) {
           await this.bus.send(this.createResponse(
             message.from,
@@ -211,7 +223,7 @@ export class ClaudeCodeActor implements Actor {
 
       const truncate = (s: string, n: number) => s.length > n ? s.slice(0, n) + "..." : s;
 
-      const response = await this.adapter.query(text, async (cm) => {
+      const response = await this.adapter.query(mergedText, async (cm) => {
         try {
           // assistant のテキストチャンク
           if (cm?.type === "assistant") {
@@ -296,12 +308,15 @@ export class ClaudeCodeActor implements Actor {
       });
 
       // 既存の最終応答も維持
-      return this.createResponse(
-        message.from,
-        "claude-response",
-        { text: response, sessionId: this.adapter.getCurrentSessionId() },
-        message.id,
-      );
+      if (this.bus) {
+        await this.bus.send(this.createResponse(
+          message.from,
+          "claude-response",
+          { text: response, sessionId: this.adapter.getCurrentSessionId() },
+          message.id,
+        ));
+      }
+      return;
     } catch (error) {
       console.error(`[${this.name}] Error querying Claude:`, error);
       const parsed = this.parseClaudeError(error);
@@ -328,6 +343,30 @@ export class ClaudeCodeActor implements Actor {
       }
       return;
     }
+  }
+
+  private buildMessageContent(text: string, attachments: ImportedAttachment[]): string {
+    if (attachments.length === 0) return text;
+
+    const lines: string[] = ["[Attachments imported]"];
+    for (const attachment of attachments) {
+      const sizeLabel = `${attachment.size} bytes`;
+      const descriptor = attachment.contentType
+        ? `${sizeLabel}, ${attachment.contentType}`
+        : sizeLabel;
+      lines.push(`- ${attachment.filename} (${descriptor}) -> ${attachment.path}`);
+      if (attachment.isText && attachment.contentPreview) {
+        lines.push(`--- preview: ${attachment.filename} ---`);
+        const snippet = attachment.contentPreview.slice(0, ATTACHMENT_PREVIEW_CHAR_LIMIT);
+        lines.push(snippet);
+        lines.push(`--- end preview ---`);
+      }
+    }
+    lines.push("");
+    lines.push("必要なら `Read(<path>)` でファイル全体を参照してください。");
+
+    const preamble = lines.join("\n");
+    return text ? `${preamble}\n\n${text}` : preamble;
   }
 
   private parseClaudeError(error: unknown):
@@ -438,7 +477,7 @@ export class ClaudeCodeActor implements Actor {
       return;
     }
 
-    const clonedPayload = {
+    const clonedPayload: Record<string, unknown> = {
       ...(stored.request.payload as Record<string, unknown>),
       channelId,
     };
