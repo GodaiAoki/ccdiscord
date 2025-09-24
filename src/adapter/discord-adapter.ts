@@ -1,19 +1,13 @@
-import {
-  Client,
-  GatewayIntentBits,
-  Message,
-  TextChannel,
-  ThreadChannel,
-} from "discord.js";
-import type { Adapter, MessageBus, ActorMessage } from "../types.ts";
+import { Client, GatewayIntentBits, Message, TextChannel, ThreadChannel } from "discord.js";
+import type { ActorMessage, Adapter, MessageBus } from "../types.ts";
 import type { Config } from "../config.ts";
 import { t } from "../i18n.ts";
 import { AuditLogger } from "../utils/audit-logger.ts";
 import { DiscordDiagnostics } from "../utils/discord-diagnostics.ts";
-import { 
-  withRetry, 
-  ConnectionStateManager, 
-  SessionPersistence 
+import {
+  ConnectionStateManager,
+  SessionPersistence,
+  withRetry,
 } from "../utils/resilient-connection.ts";
 
 // Adapter that manages Discord connection
@@ -48,7 +42,7 @@ export class DiscordAdapter implements Adapter {
     this.messageBus = messageBus;
     this.auditLogger = new AuditLogger();
     this.connectionManager = new ConnectionStateManager();
-    
+
     // セッション永続化（continueオプション用）
     if (config.sessionId) {
       this.sessionPersistence = new SessionPersistence(config.sessionId);
@@ -74,14 +68,14 @@ export class DiscordAdapter implements Adapter {
 
     try {
       await this.auditLogger.init();
-      
+
       // 診断機能を有効化
       const enableDiagnostics = Deno.env.get("DISCORD_DIAGNOSTICS") !== "false";
       if (enableDiagnostics) {
         console.log(`[${this.name}] Diagnostics enabled`);
         this.diagnostics = new DiscordDiagnostics(this.client);
       }
-      
+
       await this.client.login(this.config.discordToken);
       this.isRunning = true;
       await this.auditLogger.logSessionStart(this.config.sessionId || "default", Deno.cwd());
@@ -148,7 +142,7 @@ export class DiscordAdapter implements Adapter {
           // Resume不可能な場合、ランダム待機後に再接続
           const waitTime = 1000 + Math.floor(Math.random() * 4000); // 1-5秒
           console.log(`[gw] Waiting ${waitTime}ms before reconnecting...`);
-          await new Promise(resolve => setTimeout(resolve, waitTime));
+          await new Promise((resolve) => setTimeout(resolve, waitTime));
 
           try {
             await this.client.destroy();
@@ -165,7 +159,7 @@ export class DiscordAdapter implements Adapter {
 
   private async handleReady(): Promise<void> {
     console.log(
-      `[${this.name}] ${t("discord.ready")} ${this.client.user?.tag}`
+      `[${this.name}] ${t("discord.ready")} ${this.client.user?.tag}`,
     );
 
     try {
@@ -193,7 +187,7 @@ export class DiscordAdapter implements Adapter {
       await withRetry(
         () => this.currentThread!.send(initialMessage),
         "thread.send.initial",
-        { maxRetries: 3, initialDelay: 1000 }
+        { maxRetries: 3, initialDelay: 1000 },
       );
 
       console.log(`[${this.name}] ${t("discord.threadCreated")} ${threadName}`);
@@ -207,14 +201,8 @@ export class DiscordAdapter implements Adapter {
 
 **${t("discord.sessionInfo.startTime")}**: ${new Date().toISOString()}
 **${t("discord.sessionInfo.workDir")}**: \`${Deno.cwd()}\`
-**${t("discord.sessionInfo.mode")}**: ${
-      this.config.debugMode ? "Debug" : "Production"
-    }
-${
-  this.config.neverSleep
-    ? `**${t("discord.sessionInfo.neverSleepEnabled")}**`
-    : ""
-}
+**${t("discord.sessionInfo.mode")}**: ${this.config.debugMode ? "Debug" : "Production"}
+${this.config.neverSleep ? `**${t("discord.sessionInfo.neverSleepEnabled")}**` : ""}
 
 ---
 
@@ -223,6 +211,7 @@ ${t("discord.instructions.header")}
 - \`!stop\`: ${t("discord.instructions.stop")}
 - \`!exit\`: ${t("discord.instructions.exit")}
 - \`!<command>\`: ${t("discord.instructions.shellCommand")}
+- \`!retry\`: 直前のリクエストを再実行します（使用制限解除後に便利です）
 - ${t("discord.instructions.normalMessage")}`;
   }
 
@@ -231,8 +220,9 @@ ${t("discord.instructions.header")}
     if (message.author.bot) return;
 
     // Ignore messages outside current thread
-    if (!this.currentThread || message.channel.id !== this.currentThread.id)
+    if (!this.currentThread || message.channel.id !== this.currentThread.id) {
       return;
+    }
 
     // Check if user is allowed
     if (!this.isUserAllowed(message.author.id)) {
@@ -240,9 +230,10 @@ ${t("discord.instructions.header")}
       await this.auditLogger.logAuthFailure(message.author.id, message.channel.id);
       // Send warning message if user is not allowed
       await withRetry(
-        () => message.reply(t("discord.userNotAllowed") || "You are not authorized to use this bot."),
+        () =>
+          message.reply(t("discord.userNotAllowed") || "You are not authorized to use this bot."),
         "message.reply.auth",
-        { maxRetries: 2, initialDelay: 500 }
+        { maxRetries: 2, initialDelay: 500 },
       );
       return;
     }
@@ -251,17 +242,31 @@ ${t("discord.instructions.header")}
     if (!content) return;
 
     console.log(
-      `[${this.name}] ${t("discord.receivedMessage")} ${
-        message.author.username
-      }: ${content}`
+      `[${this.name}] ${t("discord.receivedMessage")} ${message.author.username}: ${content}`,
     );
+
+    if (content === "!retry") {
+      await this.messageBus.send({
+        id: message.id,
+        from: "discord",
+        to: "assistant",
+        type: "discord-command",
+        payload: {
+          text: content,
+          authorId: message.author.id,
+          channelId: message.channel.id,
+        },
+        timestamp: new Date(),
+      });
+      return;
+    }
 
     // Log user message
     await this.auditLogger.logUserMessage(
       message.author.id,
       message.author.username,
       message.channel.id,
-      content
+      content,
     );
 
     // Convert Discord message to ActorMessage
@@ -289,7 +294,7 @@ ${t("discord.instructions.header")}
 
   private async handleActorResponse(
     originalMessage: Message,
-    response: ActorMessage
+    response: ActorMessage,
   ): Promise<void> {
     // Handle system commands
     if (response.to === "system") {
@@ -303,30 +308,28 @@ ${t("discord.instructions.header")}
 
       if (assistantResponse) {
         // Filter out auto-responder messages if it's disabled
-        const autoResponderEnabled = 
-          Deno.env.get("ENABLE_AUTO_RESPONDER") === "true" ||
+        const autoResponderEnabled = Deno.env.get("ENABLE_AUTO_RESPONDER") === "true" ||
           Deno.env.get("NEVER_SLEEP") === "true";
-        
+
         if (assistantResponse.from === "auto-responder" && !autoResponderEnabled) {
           console.log(`[${this.name}] Filtered auto-responder message (disabled)`);
           return;
         }
-        
+
         // Filter out Claude Code's "Todos" tool output noise
         const payload: any = assistantResponse.payload ?? {};
         const txt = (payload.text ?? "").toString();
         const toolName = payload.toolName || payload.tool || "";
-        const looksLikeTodos =
-          /Todos have been modified successfully/i.test(txt) ||
+        const looksLikeTodos = /Todos have been modified successfully/i.test(txt) ||
           /continue to use the todo list/i.test(txt) ||
           /ensure that you continue to use the todo list/i.test(txt) ||
           /^Todos$/i.test(toolName);
-        
+
         if (looksLikeTodos) {
           console.log(`[${this.name}] Suppressed Todos tool output`);
           return;
         }
-        
+
         const text = (assistantResponse.payload as { text?: string })?.text;
         if (text) {
           // Avoid duplicate final send if streaming path already handled completion
@@ -346,7 +349,7 @@ ${t("discord.instructions.header")}
 
   private async handleSystemCommand(
     message: Message,
-    response: ActorMessage
+    response: ActorMessage,
   ): Promise<void> {
     const channel = message.channel as TextChannel | ThreadChannel;
 
@@ -357,7 +360,7 @@ ${t("discord.instructions.header")}
         await withRetry(
           () => channel.send(t("discord.commands.resetComplete")),
           "channel.send.reset",
-          { maxRetries: 3, initialDelay: 1000 }
+          { maxRetries: 3, initialDelay: 1000 },
         );
         break;
 
@@ -365,7 +368,7 @@ ${t("discord.instructions.header")}
         await withRetry(
           () => channel.send(t("discord.commands.stopComplete")),
           "channel.send.stop",
-          { maxRetries: 3, initialDelay: 1000 }
+          { maxRetries: 3, initialDelay: 1000 },
         );
         break;
 
@@ -373,7 +376,7 @@ ${t("discord.instructions.header")}
         await withRetry(
           () => channel.send(t("discord.commands.exitMessage")),
           "channel.send.exit",
-          { maxRetries: 2, initialDelay: 500 }
+          { maxRetries: 2, initialDelay: 500 },
         );
         await this.stop();
         Deno.exit(0);
@@ -386,11 +389,12 @@ ${t("discord.instructions.header")}
         // - Run commands in a sandboxed environment
         // - Log all command executions for audit purposes
         await withRetry(
-          () => channel.send(
-            "⚠️ Shell command execution is disabled for security reasons."
-          ),
+          () =>
+            channel.send(
+              "⚠️ Shell command execution is disabled for security reasons.",
+            ),
           "channel.send.shell-warning",
-          { maxRetries: 2, initialDelay: 500 }
+          { maxRetries: 2, initialDelay: 500 },
         );
         break;
     }
@@ -398,7 +402,7 @@ ${t("discord.instructions.header")}
 
   private async sendLongMessage(
     message: Message,
-    content: string
+    content: string,
   ): Promise<void> {
     const channel = message.channel as TextChannel | ThreadChannel;
     const messages: string[] = [];
@@ -422,14 +426,14 @@ ${t("discord.instructions.header")}
         await withRetry(
           () => channel.send(msg),
           "channel.send.long-message",
-          { maxRetries: 3, initialDelay: 1000 }
+          { maxRetries: 3, initialDelay: 1000 },
         );
         // Wait a bit to avoid rate limiting
         await new Promise((resolve) => setTimeout(resolve, 1000));
       } catch (error) {
         console.error(
           `[${this.name}] ${t("discord.failedSendMessage")}`,
-          error
+          error,
         );
       }
     }
@@ -464,8 +468,9 @@ ${t("discord.instructions.header")}
       type !== "stream-partial" &&
       type !== "stream-completed" &&
       type !== "stream-error"
-    )
+    ) {
       return;
+    }
 
     const cfg = this.getStreamingConfig();
     if (!cfg.enabled) return;
@@ -478,8 +483,9 @@ ${t("discord.instructions.header")}
     if (
       !this.currentThread ||
       (channelId && this.currentThread.id !== channelId)
-    )
+    ) {
       return;
+    }
     if (!id) return;
 
     switch (type) {
@@ -493,11 +499,7 @@ ${t("discord.instructions.header")}
         void this.onStreamCompleted(id, channelId, payload?.fullText ?? "");
         break;
       case "stream-error":
-        void this.onStreamError(
-          id,
-          channelId,
-          payload?.message ?? "Unknown error"
-        );
+        void this.onStreamError(id, channelId, payload ?? {});
         break;
     }
   }
@@ -505,7 +507,7 @@ ${t("discord.instructions.header")}
   private async onStreamStarted(
     id: string,
     channelId?: string,
-    _meta?: any
+    _meta?: any,
   ): Promise<void> {
     const cfg = this.getStreamingConfig();
     const state = {
@@ -521,7 +523,7 @@ ${t("discord.instructions.header")}
         const msg = await withRetry(
           () => this.currentThread!.send("🤔 考え中..."),
           "thread.send.thinking",
-          { maxRetries: 2, initialDelay: 500 }
+          { maxRetries: 2, initialDelay: 500 },
         );
         state.thinkingMessage = msg;
       } catch (e) {
@@ -545,9 +547,7 @@ ${t("discord.instructions.header")}
   private async flushNow(id: string): Promise<void> {
     const st = this.streamStates.get(id);
     if (!st || !this.currentThread) return;
-    const out = `${st.toolBuffer}${st.toolBuffer && st.buffer ? "\n" : ""}${
-      st.buffer
-    }`.trim();
+    const out = `${st.toolBuffer}${st.toolBuffer && st.buffer ? "\n" : ""}${st.buffer}`.trim();
     if (!out) return;
 
     try {
@@ -555,14 +555,14 @@ ${t("discord.instructions.header")}
         await withRetry(
           () => st.thinkingMessage!.edit(this.capContent(out)),
           "message.edit.stream",
-          { maxRetries: 3, initialDelay: 1000 }
+          { maxRetries: 3, initialDelay: 1000 },
         );
       } else {
         // append mode or no thinking message available
         await withRetry(
           () => this.currentThread!.send(this.capContent(out)),
           "thread.send.stream",
-          { maxRetries: 3, initialDelay: 1000 }
+          { maxRetries: 3, initialDelay: 1000 },
         );
       }
     } catch (e) {
@@ -576,7 +576,7 @@ ${t("discord.instructions.header")}
   private async onStreamPartial(
     id: string,
     _channelId: string | undefined,
-    payload: any
+    payload: any,
   ): Promise<void> {
     const st = this.streamStates.get(id);
     if (!st) {
@@ -621,14 +621,14 @@ ${t("discord.instructions.header")}
         await withRetry(
           () => this.currentThread!.send(msg),
           "thread.send.completed",
-          { maxRetries: 3, initialDelay: 1000 }
+          { maxRetries: 3, initialDelay: 1000 },
         );
         // Wait to avoid rate limiting (keep parity with sendLongMessage)
         await new Promise((resolve) => setTimeout(resolve, 1000));
       } catch (error) {
         console.error(
           `[${this.name}] ${t("discord.failedSendMessage")}`,
-          error
+          error,
         );
       }
     }
@@ -637,7 +637,7 @@ ${t("discord.instructions.header")}
   private async onStreamCompleted(
     id: string,
     _channelId: string | undefined,
-    fullText: string
+    fullText: string,
   ): Promise<void> {
     const st = this.streamStates.get(id);
     if (st?.timer) {
@@ -668,7 +668,7 @@ ${t("discord.instructions.header")}
         await withRetry(
           () => this.currentThread!.send("✅ done"),
           "thread.send.done",
-          { maxRetries: 2, initialDelay: 500 }
+          { maxRetries: 2, initialDelay: 500 },
         );
       }
     } catch (e) {
@@ -684,7 +684,7 @@ ${t("discord.instructions.header")}
   private async onStreamError(
     id: string,
     _channelId: string | undefined,
-    message: string
+    payload: { message?: string; fatal?: boolean },
   ): Promise<void> {
     const st = this.streamStates.get(id);
     if (st?.timer) {
@@ -702,11 +702,17 @@ ${t("discord.instructions.header")}
     const cfg = this.getStreamingConfig();
     if (cfg.showAbort && this.currentThread) {
       try {
-        await withRetry(
-          () => this.currentThread!.send(`⚠️ ストリーミング中断: ${message}`),
-          "thread.send.abort",
-          { maxRetries: 2, initialDelay: 500 }
-        );
+        const fatal = payload?.fatal !== false;
+        const text = fatal
+          ? `⚠️ ストリーミング中断: ${payload?.message ?? "Unknown error"}`
+          : payload?.message ?? "";
+        if (text) {
+          await withRetry(
+            () => this.currentThread!.send(text),
+            "thread.send.abort",
+            { maxRetries: 2, initialDelay: 500 },
+          );
+        }
       } catch {
         // ignore
       }

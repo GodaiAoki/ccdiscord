@@ -2,6 +2,91 @@ import { type Options, query as sdkQuery } from "@anthropic-ai/claude-code";
 import type { Adapter, ClaudeMessage } from "../types.ts";
 import type { Config } from "../config.ts";
 
+type ClaudeErrorKind =
+  | "USAGE_LIMIT"
+  | "IMAGE_TOO_LARGE"
+  | "NETWORK"
+  | "CLI_NOT_FOUND"
+  | "UNKNOWN";
+
+interface ClaudeErrorPayload {
+  tag: "CLAUDE_ERROR";
+  hint: string;
+  kind: ClaudeErrorKind;
+  retryAfterMs?: number;
+  meta: Record<string, unknown>;
+}
+
+const CLAUDE_ERROR_TAG = "CLAUDE_ERROR" as const;
+
+function env(name: string, fallback = ""): string {
+  try {
+    return Deno.env.get(name) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function detectUsageLimitReset(message: string): number | undefined {
+  const match = message.match(/resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+  if (!match) return undefined;
+
+  const now = new Date();
+  let hours = parseInt(match[1], 10);
+  const minutes = match[2] ? parseInt(match[2], 10) : 0;
+  const ampm = (match[3] ?? "").toLowerCase();
+
+  if (ampm === "pm" && hours < 12) hours += 12;
+  if (ampm === "am" && hours === 12) hours = 0;
+
+  const target = new Date(now);
+  target.setHours(hours, minutes, 0, 0);
+  if (target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
+  return Math.max(target.getTime() - now.getTime(), 0);
+}
+
+function analyseClaudeError(message: string): {
+  kind: ClaudeErrorKind;
+  hint: string;
+  retryAfterMs?: number;
+} {
+  const lower = message.toLowerCase();
+  if (/5[-\s]*hour limit reached/i.test(message) || /status\s*429/i.test(lower)) {
+    return {
+      kind: "USAGE_LIMIT",
+      hint:
+        "Anthropic Claude の利用上限ウィンドウに到達しました。リセットまで待ってから再試行してください。",
+      retryAfterMs: detectUsageLimitReset(message),
+    };
+  }
+
+  if (/image exceeds 5 mb maximum/i.test(message)) {
+    return {
+      kind: "IMAGE_TOO_LARGE",
+      hint: "画像が 5MB の上限を超えています。圧縮・縮小してから再実行してください。",
+    };
+  }
+
+  if (/eai_again|econnreset|enotfound|etimedout|network error/i.test(lower)) {
+    return {
+      kind: "NETWORK",
+      hint: "ネットワークエラーが発生しました。少し待ってから再試行してください。",
+    };
+  }
+
+  if (/command not found|enoent|spawn/i.test(lower)) {
+    return {
+      kind: "CLI_NOT_FOUND",
+      hint: "Claude CLI が見つかりません。パスやインストール状態を確認してください。",
+    };
+  }
+
+  return {
+    kind: "UNKNOWN",
+    hint: "Claude Code がエラー終了しました。ログを確認してください。",
+  };
+}
+
 // DI interface to abstract Claude Code client
 export interface ClaudeClient {
   query(args: {
@@ -67,7 +152,7 @@ export class ClaudeCodeAdapter implements Adapter {
   // Send query to Claude API
   async query(
     prompt: string,
-    onProgress?: (message: ClaudeMessage) => Promise<void>
+    onProgress?: (message: ClaudeMessage) => Promise<void>,
   ): Promise<string> {
     const options: Options = {
       maxTurns: this.config.maxTurns,
@@ -75,9 +160,7 @@ export class ClaudeCodeAdapter implements Adapter {
       permissionMode: (this.config.claudePermissionMode ??
         "bypassPermissions") as Options["permissionMode"],
       ...(this.isFirstQuery ? {} : { continue: true }),
-      ...(this.config.sessionId && this.isFirstQuery
-        ? { resume: this.config.sessionId }
-        : {}),
+      ...(this.config.sessionId && this.isFirstQuery ? { resume: this.config.sessionId } : {}),
     };
 
     this.abortController = new AbortController();
@@ -113,7 +196,7 @@ export class ClaudeCodeAdapter implements Adapter {
           // Save session ID
           this.currentSessionId = message.session_id;
           console.log(
-            `[${this.name}] Session started: ${this.currentSessionId}`
+            `[${this.name}] Session started: ${this.currentSessionId}`,
           );
 
           if (this.isFirstQuery) {
@@ -131,10 +214,9 @@ export class ClaudeCodeAdapter implements Adapter {
                 item.type === "tool_result" &&
                 typeof item.content === "string"
               ) {
-                const truncated =
-                  item.content.length > 300
-                    ? item.content.substring(0, 300) + "..."
-                    : item.content;
+                const truncated = item.content.length > 300
+                  ? item.content.substring(0, 300) + "..."
+                  : item.content;
                 toolResults += `\n📋 Tool execution result:\n\`\`\`\n${truncated}\n\`\`\`\n`;
               }
             }
@@ -153,43 +235,49 @@ export class ClaudeCodeAdapter implements Adapter {
         throw new Error("Query was aborted");
       }
 
-      // Collect diagnostics (non-fatal, best-effort)
-      const permissionMode =
-        this.config.claudePermissionMode ?? "bypassPermissions";
-      let cwd = "";
+      const rawMsg = error instanceof Error ? error.message : String(error);
+      const analysis = analyseClaudeError(rawMsg);
+      const permissionMode = this.config.claudePermissionMode ?? "bypassPermissions";
+
+      let cwd = "unknown";
       try {
         cwd = Deno.cwd();
-      } catch {
-        cwd = "unknown";
-      }
-      let firstPath = "";
-      try {
-        const p = Deno.env.get("PATH") ?? "";
-        firstPath = p.split(":")[0] ?? "";
-      } catch {
-        firstPath = "unknown";
-      }
+      } catch { /* ignore */ }
 
-      const rawMsg = error instanceof Error ? error.message : String(error);
-      // Rate limit detection (non-fatal hint only)
-      const rateLimited = /429|rate[ -]?limit|too many requests/i.test(rawMsg);
+      let firstPath = "unknown";
+      try {
+        const p = env("PATH", "");
+        firstPath = p.split(":")[0] ?? "unknown";
+      } catch { /* ignore */ }
+
+      const rateLimited = analysis.kind === "USAGE_LIMIT";
       let cliPresence = "unknown";
       if (this.shouldRunPreflight(rawMsg) && !this.preflightChecked) {
         this.preflightChecked = true;
         try {
           cliPresence = await this.checkClaudeCliPresence();
         } catch {
-          // swallow any errors and fallback
           cliPresence = "not_found_or_failed";
         }
       }
-      const hint = `\nhint: permissionMode=${permissionMode}, cwd=${cwd}, PATH[0]=${firstPath}, cli=${cliPresence}, rate_limited=${rateLimited}`;
 
-      if (error instanceof Error) {
-        // Wrap error while preserving original message (e.g. "exited with code" and stderr info)
-        throw new Error(`ClaudeCodeAdapter: ${error.message}${hint}`);
-      }
-      throw new Error(`ClaudeCodeAdapter: Unknown error${hint}`);
+      const payload: ClaudeErrorPayload = {
+        tag: CLAUDE_ERROR_TAG,
+        hint: analysis.hint,
+        kind: analysis.kind,
+        retryAfterMs: analysis.retryAfterMs,
+        meta: {
+          message: rawMsg,
+          permissionMode,
+          cwd,
+          pathHead: firstPath,
+          cli: cliPresence,
+          rateLimited,
+        },
+      };
+
+      console.error(`[${this.name}] Claude query failed`, payload);
+      throw new Error(JSON.stringify(payload));
     }
   }
 
@@ -201,9 +289,7 @@ export class ClaudeCodeAdapter implements Adapter {
       permissionMode: (this.config.claudePermissionMode ??
         "bypassPermissions") as Options["permissionMode"],
       ...(this.isFirstQuery ? {} : { continue: true }),
-      ...(this.config.sessionId && this.isFirstQuery
-        ? { resume: this.config.sessionId }
-        : {}),
+      ...(this.config.sessionId && this.isFirstQuery ? { resume: this.config.sessionId } : {}),
     };
 
     this.abortController = new AbortController();
@@ -260,10 +346,9 @@ export class ClaudeCodeAdapter implements Adapter {
                 item.type === "tool_result" &&
                 typeof item.content === "string"
               ) {
-                const truncated =
-                  item.content.length > 300
-                    ? item.content.substring(0, 300) + "..."
-                    : item.content;
+                const truncated = item.content.length > 300
+                  ? item.content.substring(0, 300) + "..."
+                  : item.content;
                 const toolText = `📋 Tool execution result:\n\`\`\`\n${truncated}\n\`\`\`\n`;
                 yield { type: "tool", content: toolText, raw: item };
               }
@@ -280,25 +365,22 @@ export class ClaudeCodeAdapter implements Adapter {
         throw new Error("Query was aborted");
       }
 
-      // 既存 query() と同等のヒント付きエラー
-      const permissionMode =
-        this.config.claudePermissionMode ?? "bypassPermissions";
-      let cwd = "";
+      const rawMsg = error instanceof Error ? error.message : String(error);
+      const analysis = analyseClaudeError(rawMsg);
+      const permissionMode = this.config.claudePermissionMode ?? "bypassPermissions";
+
+      let cwd = "unknown";
       try {
         cwd = Deno.cwd();
-      } catch {
-        cwd = "unknown";
-      }
-      let firstPath = "";
-      try {
-        const p = Deno.env.get("PATH") ?? "";
-        firstPath = p.split(":")[0] ?? "";
-      } catch {
-        firstPath = "unknown";
-      }
+      } catch { /* ignore */ }
 
-      const rawMsg = error instanceof Error ? error.message : String(error);
-      const rateLimited = /429|rate[ -]?limit|too many requests/i.test(rawMsg);
+      let firstPath = "unknown";
+      try {
+        const p = env("PATH", "");
+        firstPath = p.split(":")[0] ?? "unknown";
+      } catch { /* ignore */ }
+
+      const rateLimited = analysis.kind === "USAGE_LIMIT";
       let cliPresence = "unknown";
       if (this.shouldRunPreflight(rawMsg) && !this.preflightChecked) {
         this.preflightChecked = true;
@@ -308,14 +390,24 @@ export class ClaudeCodeAdapter implements Adapter {
           cliPresence = "not_found_or_failed";
         }
       }
-      const hint = `\nhint: permissionMode=${permissionMode}, cwd=${cwd}, PATH[0]=${firstPath}, cli=${cliPresence}, rate_limited=${rateLimited}`;
 
-      if (error instanceof Error) {
-        throw new Error(
-          `ClaudeCodeAdapter.queryStream: ${error.message}${hint}`
-        );
-      }
-      throw new Error(`ClaudeCodeAdapter.queryStream: Unknown error${hint}`);
+      const payload: ClaudeErrorPayload = {
+        tag: CLAUDE_ERROR_TAG,
+        hint: analysis.hint,
+        kind: analysis.kind,
+        retryAfterMs: analysis.retryAfterMs,
+        meta: {
+          message: rawMsg,
+          permissionMode,
+          cwd,
+          pathHead: firstPath,
+          cli: cliPresence,
+          rateLimited,
+        },
+      };
+
+      console.error(`[${this.name}] Claude queryStream failed`, payload);
+      throw new Error(JSON.stringify(payload));
     }
   }
 
