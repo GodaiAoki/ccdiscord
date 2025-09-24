@@ -1,7 +1,7 @@
 import { Client, GatewayIntentBits, Message, TextChannel, ThreadChannel } from "discord.js";
 import type { Attachment } from "discord.js";
 import { ensureDir } from "@std/fs";
-import { join } from "@std/path";
+import { extname, join } from "@std/path";
 import type { ActorMessage, Adapter, ImportedAttachment, MessageBus } from "../types.ts";
 import type { Config } from "../config.ts";
 import { t } from "../i18n.ts";
@@ -17,6 +17,11 @@ const ATTACHMENTS_ENABLED = (Deno.env.get("CCDISCORD_ATTACH_ENABLE") ?? "true").
   "false";
 const MAX_TEXT_BYTES = parseEnvNumber("CCDISCORD_ATTACH_MAX_TEXT_BYTES", 1_000_000);
 const PREVIEW_BYTES = parseEnvNumber("CCDISCORD_ATTACH_INLINE_PREVIEW_BYTES", 8_000);
+const MAX_IMAGE_BYTES = parseEnvNumber("CCDISCORD_ATTACH_MAX_IMAGE_BYTES", 5_000_000);
+const IMAGE_PREVIEW_WIDTH = parseEnvNumber("CCDISCORD_ATTACH_IMAGE_PREVIEW_WIDTH", 512);
+const MAX_IMAGE_PREVIEW_BYTES = parseEnvNumber("CCDISCORD_ATTACH_MAX_PREVIEW_BYTES", 80_000);
+const IMAGE_PREVIEW_ENABLED = (Deno.env.get("CCDISCORD_ATTACH_IMAGE_PREVIEW_ENABLE") ??
+  "true").toLowerCase() !== "false";
 const ATTACH_BASE_DIR = Deno.env.get("CCDISCORD_ATTACH_BASEDIR");
 const DISCORD_CDN_REGEX = /^https:\/\/(cdn|media)\.discord(app)?\.com\//i;
 const TEXT_EXTENSIONS = new Set([
@@ -60,6 +65,12 @@ const TEXT_EXTENSIONS = new Set([
   ".zsh",
   ".ps1",
 ]);
+const IMAGE_EXTENSIONS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+]);
 
 function parseEnvNumber(key: string, fallback: number): number {
   const raw = Deno.env.get(key);
@@ -85,6 +96,14 @@ function isLikelyText(filename: string, contentType?: string | null): boolean {
   return TEXT_EXTENSIONS.has(extensionOf(filename));
 }
 
+function isLikelyImage(filename: string, contentType?: string | null): boolean {
+  if (contentType) {
+    const lowered = contentType.toLowerCase();
+    if (lowered.startsWith("image/")) return true;
+  }
+  return IMAGE_EXTENSIONS.has(extensionOf(filename));
+}
+
 function sanitizeFilename(name: string): string {
   const trimmed = name.trim() || "attachment";
   const replaced = trimmed.replace(/[^\w.\-+@]+/g, "_");
@@ -96,6 +115,84 @@ function resolveAttachmentDir(channelId: string): string {
     ? (ATTACH_BASE_DIR.startsWith("/") ? ATTACH_BASE_DIR : join(Deno.cwd(), ATTACH_BASE_DIR))
     : join(Deno.cwd(), "attachments");
   return join(base, channelId);
+}
+
+function toDisplayPath(absolutePath: string): string {
+  const cwd = Deno.cwd();
+  if (absolutePath.startsWith(`${cwd}/`)) {
+    return absolutePath.slice(cwd.length + 1);
+  }
+  if (absolutePath.startsWith(`${cwd}\\`)) {
+    return absolutePath.slice(cwd.length + 1);
+  }
+  return absolutePath;
+}
+
+async function runCommand(command: string, args: string[]): Promise<boolean> {
+  try {
+    const cmd = new Deno.Command(command, {
+      args,
+      stdin: "null",
+      stdout: "null",
+      stderr: "null",
+    });
+    const { success } = await cmd.output();
+    return success;
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) {
+      return false;
+    }
+    console.warn(`[attachments] Command '${command}' failed`, error);
+    return false;
+  }
+}
+
+async function generateImagePreview(sourcePath: string): Promise<string | undefined> {
+  if (!IMAGE_PREVIEW_ENABLED) return undefined;
+
+  const ext = extname(sourcePath);
+  const previewPath = ext
+    ? `${sourcePath.slice(0, sourcePath.length - ext.length)}.preview${ext}`
+    : `${sourcePath}.preview`;
+
+  const attempts: Array<{ cmd: string; args: string[] }> = [
+    {
+      cmd: "magick",
+      args: [sourcePath, "-resize", `${IMAGE_PREVIEW_WIDTH}x${IMAGE_PREVIEW_WIDTH}>`, previewPath],
+    },
+    {
+      cmd: "convert",
+      args: [sourcePath, "-resize", `${IMAGE_PREVIEW_WIDTH}x${IMAGE_PREVIEW_WIDTH}>`, previewPath],
+    },
+    {
+      cmd: "sips",
+      args: ["-Z", String(IMAGE_PREVIEW_WIDTH), sourcePath, "--out", previewPath],
+    },
+  ];
+
+  for (const attempt of attempts) {
+    const ok = await runCommand(attempt.cmd, attempt.args);
+    if (!ok) {
+      continue;
+    }
+    try {
+      const info = await Deno.stat(previewPath);
+      if (info.size > MAX_IMAGE_PREVIEW_BYTES) {
+        console.warn(
+          `[attachments] Discarded preview at ${previewPath} (size ${info.size} bytes exceeds limit)`,
+        );
+        await Deno.remove(previewPath).catch(() => {});
+        continue;
+      }
+      return previewPath;
+    } catch (error) {
+      console.warn(`[attachments] Preview generation failed to stat ${previewPath}`, error);
+    }
+  }
+
+  // Clean up if preview file partially created
+  await Deno.remove(previewPath).catch(() => {});
+  return undefined;
 }
 
 // Adapter that manages Discord connection
@@ -333,14 +430,19 @@ ${t("discord.instructions.header")}
     const sanitized = sanitizeFilename(filename);
     const contentType = attachment.contentType ?? undefined;
     const isText = isLikelyText(filename, contentType ?? null);
-    if (!isText) {
+    const isImage = !isText && isLikelyImage(filename, contentType ?? null);
+    if (!isText && !isImage) {
+      console.warn(
+        `[${this.name}] Unsupported attachment skipped: ${filename} (${contentType ?? "unknown"})`,
+      );
       return null;
     }
 
     const sizeHint = typeof attachment.size === "number" ? attachment.size : 0;
-    if (sizeHint && sizeHint > MAX_TEXT_BYTES) {
+    const sizeLimit = isText ? MAX_TEXT_BYTES : MAX_IMAGE_BYTES;
+    if (sizeHint && sizeHint > sizeLimit) {
       console.warn(
-        `[${this.name}] Skipped attachment ${filename} (${sizeHint} bytes), exceeds text limit`,
+        `[${this.name}] Skipped attachment ${filename} (${sizeHint} bytes), exceeds limit ${sizeLimit}`,
       );
       return null;
     }
@@ -350,41 +452,76 @@ ${t("discord.instructions.header")}
     const storedPath = join(dir, `${Date.now()}_${sanitized}`);
 
     const response = await fetch(url);
-    if (!response.ok) {
+    if (!response.ok || !response.body) {
       throw new Error(`Attachment fetch failed with status ${response.status}`);
     }
 
-    const buffer = new Uint8Array(await response.arrayBuffer());
-    if (buffer.byteLength > MAX_TEXT_BYTES) {
-      console.warn(
-        `[${this.name}] Skipped attachment ${filename} after download; size ${buffer.byteLength} bytes`,
-      );
-      return null;
+    const file = await Deno.open(storedPath, { create: true, write: true });
+    const reader = response.body.getReader();
+    let totalBytes = 0;
+    const textChunks: Uint8Array[] = [];
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        totalBytes += value.byteLength;
+        if (totalBytes > sizeLimit) {
+          throw new Error(`attachment exceeds limit (${totalBytes} > ${sizeLimit})`);
+        }
+        await file.write(value);
+        if (isText) {
+          textChunks.push(value);
+        }
+      }
+    } catch (error) {
+      await Deno.remove(storedPath).catch(() => {});
+      throw error;
+    } finally {
+      file.close();
     }
 
-    await Deno.writeFile(storedPath, buffer);
+    const displayPath = toDisplayPath(storedPath);
 
-    const cwd = Deno.cwd();
-    let displayPath = storedPath;
-    if (storedPath.startsWith(`${cwd}/`)) {
-      displayPath = storedPath.slice(cwd.length + 1);
-    } else if (storedPath.startsWith(`${cwd}\\`)) {
-      displayPath = storedPath.slice(cwd.length + 1);
+    if (isText) {
+      const merged = new Uint8Array(Math.min(totalBytes, PREVIEW_BYTES));
+      let offset = 0;
+      for (const chunk of textChunks) {
+        if (offset >= merged.byteLength) break;
+        const slice = chunk.subarray(0, Math.max(0, merged.byteLength - offset));
+        merged.set(slice, offset);
+        offset += slice.byteLength;
+      }
+      const preview = new TextDecoder("utf-8", { fatal: false }).decode(merged);
+      return {
+        filename,
+        path: displayPath,
+        size: totalBytes,
+        contentType,
+        isText: true,
+        contentPreview: preview,
+      };
     }
 
-    let preview: string | undefined;
-    if (buffer.byteLength > 0) {
-      const slice = buffer.subarray(0, Math.min(PREVIEW_BYTES, buffer.byteLength));
-      preview = new TextDecoder("utf-8", { fatal: false }).decode(slice);
+    let previewPath: string | undefined;
+    if (IMAGE_PREVIEW_ENABLED) {
+      try {
+        const generated = await generateImagePreview(storedPath);
+        if (generated) {
+          previewPath = toDisplayPath(generated);
+        }
+      } catch (error) {
+        console.warn(`[${this.name}] Image preview generation failed for ${filename}`, error);
+      }
     }
 
     return {
       filename,
       path: displayPath,
-      size: buffer.byteLength,
+      size: totalBytes,
       contentType,
-      isText,
-      contentPreview: preview,
+      isImage: true,
+      previewPath,
     };
   }
 

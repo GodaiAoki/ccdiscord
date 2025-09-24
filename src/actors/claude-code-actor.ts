@@ -348,21 +348,58 @@ export class ClaudeCodeActor implements Actor {
   private buildMessageContent(text: string, attachments: ImportedAttachment[]): string {
     if (attachments.length === 0) return text;
 
-    const lines: string[] = ["[Attachments imported]"];
-    for (const attachment of attachments) {
-      const sizeLabel = `${attachment.size} bytes`;
-      const descriptor = attachment.contentType
-        ? `${sizeLabel}, ${attachment.contentType}`
-        : sizeLabel;
-      lines.push(`- ${attachment.filename} (${descriptor}) -> ${attachment.path}`);
-      if (attachment.isText && attachment.contentPreview) {
-        lines.push(`--- preview: ${attachment.filename} ---`);
-        const snippet = attachment.contentPreview.slice(0, ATTACHMENT_PREVIEW_CHAR_LIMIT);
-        lines.push(snippet);
-        lines.push(`--- end preview ---`);
+    const textAttachments = attachments.filter((item) => item.isText);
+    const imageAttachments = attachments.filter((item) => item.isImage);
+    const otherAttachments = attachments.filter((item) => !item.isText && !item.isImage);
+
+    const lines: string[] = [];
+
+    if (textAttachments.length > 0) {
+      lines.push("[Text attachments]");
+      for (const attachment of textAttachments) {
+        const sizeLabel = `${attachment.size} bytes`;
+        const descriptor = attachment.contentType
+          ? `${sizeLabel}, ${attachment.contentType}`
+          : sizeLabel;
+        lines.push(`- ${attachment.filename} (${descriptor}) -> ${attachment.path}`);
+        if (attachment.contentPreview) {
+          lines.push(`--- preview: ${attachment.filename} ---`);
+          const snippet = attachment.contentPreview.slice(0, ATTACHMENT_PREVIEW_CHAR_LIMIT);
+          lines.push(snippet);
+          lines.push(`--- end preview ---`);
+        }
       }
+      lines.push("");
     }
-    lines.push("");
+
+    if (imageAttachments.length > 0) {
+      lines.push("[Image attachments]");
+      for (const attachment of imageAttachments) {
+        const sizeLabel = `${attachment.size} bytes`;
+        const descriptor = attachment.contentType
+          ? `${sizeLabel}, ${attachment.contentType}`
+          : sizeLabel;
+        lines.push(`- ${attachment.filename} (${descriptor}) -> ${attachment.path}`);
+        if (attachment.previewPath) {
+          lines.push(`  preview: ${attachment.previewPath}`);
+        }
+      }
+      lines.push("画像を扱う際は `Read(<path>)` で原本を参照できます。");
+      lines.push("");
+    }
+
+    if (otherAttachments.length > 0) {
+      lines.push("[Other attachments]");
+      for (const attachment of otherAttachments) {
+        const sizeLabel = `${attachment.size} bytes`;
+        const descriptor = attachment.contentType
+          ? `${sizeLabel}, ${attachment.contentType}`
+          : sizeLabel;
+        lines.push(`- ${attachment.filename} (${descriptor}) -> ${attachment.path}`);
+      }
+      lines.push("");
+    }
+
     lines.push("必要なら `Read(<path>)` でファイル全体を参照してください。");
 
     const preamble = lines.join("\n");

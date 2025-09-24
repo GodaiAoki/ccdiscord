@@ -60,8 +60,10 @@ export interface ImportedAttachment {
   path: string;
   size: number;
   contentType?: string;
-  isText: boolean;
+  isText?: boolean;
+  isImage?: boolean;
   contentPreview?: string;
+  previewPath?: string;
 }
 
 // ClaudeCode-related type definitions
