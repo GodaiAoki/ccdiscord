@@ -1,4 +1,4 @@
-import type { Actor, ActorMessage, ActorResponse } from "../types.ts";
+import type { Actor, ActorMessage, ActorResponse, ImportedAttachment } from "../types.ts";
 
 // Actor that processes user input
 export class UserActor implements Actor {
@@ -20,12 +20,10 @@ export class UserActor implements Actor {
     to: string,
     type: string,
     payload: unknown,
-    originalMessageId?: string
+    originalMessageId?: string,
   ): ActorResponse {
     return {
-      id: originalMessageId
-        ? `${originalMessageId}-response`
-        : crypto.randomUUID(),
+      id: originalMessageId ? `${originalMessageId}-response` : crypto.randomUUID(),
       from: this.name,
       to,
       type,
@@ -37,18 +35,25 @@ export class UserActor implements Actor {
   async handleMessage(message: ActorMessage): Promise<ActorResponse | null> {
     console.log(`[${this.name}] Processing user input:`, message);
 
-    const content = message.payload as { text?: string; command?: string };
+    const content = message.payload as {
+      text?: string;
+      command?: string;
+      attachments?: ImportedAttachment[];
+      channelId?: string;
+    };
     const text = content.text || "";
     const command = content.command;
+    const attachments = content.attachments ?? [];
+    const channelId = content.channelId;
 
     // Process commands
     if (command) {
       return this.handleCommand(message, command);
     }
 
-    // Process text messages
-    if (text) {
-      return this.handleTextMessage(message, text);
+    // Process text or attachment messages
+    if (text || attachments.length > 0) {
+      return this.handleUserMessage(message, text, attachments, channelId);
     }
 
     // Unknown message
@@ -56,7 +61,7 @@ export class UserActor implements Actor {
       message.from,
       "error",
       { error: "No text or command provided" },
-      message.id
+      message.id,
     );
   }
 
@@ -68,7 +73,7 @@ export class UserActor implements Actor {
           "system",
           "reset-session",
           { message: "Session reset requested" },
-          message.id
+          message.id,
         );
 
       case "stop":
@@ -76,7 +81,7 @@ export class UserActor implements Actor {
           "system",
           "stop-tasks",
           { message: "Stop all tasks" },
-          message.id
+          message.id,
         );
 
       case "exit":
@@ -84,7 +89,7 @@ export class UserActor implements Actor {
           "system",
           "shutdown",
           { message: "Shutdown requested" },
-          message.id
+          message.id,
         );
 
       case "help":
@@ -100,7 +105,7 @@ export class UserActor implements Actor {
               "!<command> - Execute shell command",
             ],
           },
-          message.id
+          message.id,
         );
 
       default:
@@ -110,7 +115,7 @@ export class UserActor implements Actor {
             "system",
             "execute-command",
             { command: command.substring(1) },
-            message.id
+            message.id,
           );
         }
 
@@ -118,17 +123,19 @@ export class UserActor implements Actor {
           message.from,
           "unknown-command",
           { error: `Unknown command: ${command}` },
-          message.id
+          message.id,
         );
     }
   }
 
-  private handleTextMessage(
+  private handleUserMessage(
     message: ActorMessage,
-    text: string
+    text: string,
+    attachments: ImportedAttachment[],
+    channelId?: string,
   ): ActorResponse {
     // Check for special commands
-    if (text.startsWith("!")) {
+    if (text && text.startsWith("!")) {
       const command = text.substring(1).split(" ")[0];
       return this.handleCommand(message, command);
     }
@@ -141,11 +148,12 @@ export class UserActor implements Actor {
       "user-message",
       {
         text,
+        attachments,
         originalFrom: message.from,
         originalMessageId: message.id,
-        channelId: (message.payload as { channelId?: string }).channelId,
+        channelId: channelId ?? (message.payload as { channelId?: string }).channelId,
       },
-      message.id
+      message.id,
     );
   }
 
@@ -156,14 +164,13 @@ export class UserActor implements Actor {
     }
 
     // Only route to auto-responder if it's enabled
-    const autoResponderEnabled = 
-      Deno.env.get("ENABLE_AUTO_RESPONDER") === "true" ||
+    const autoResponderEnabled = Deno.env.get("ENABLE_AUTO_RESPONDER") === "true" ||
       Deno.env.get("NEVER_SLEEP") === "true";
-    
+
     if (
       autoResponderEnabled &&
       (text.toLowerCase().includes("task") ||
-       text.toLowerCase().includes("todo"))
+        text.toLowerCase().includes("todo"))
     ) {
       return "auto-responder";
     }

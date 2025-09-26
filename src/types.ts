@@ -55,6 +55,17 @@ export interface DiscordMessage {
   timestamp: Date;
 }
 
+export interface ImportedAttachment {
+  filename: string;
+  path: string;
+  size: number;
+  contentType?: string;
+  isText?: boolean;
+  isImage?: boolean;
+  contentPreview?: string;
+  previewPath?: string;
+}
+
 // ClaudeCode-related type definitions
 export interface ClaudeMessage {
   type: "user" | "assistant" | "system" | "result";

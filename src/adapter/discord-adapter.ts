@@ -1,20 +1,199 @@
-import {
-  Client,
-  GatewayIntentBits,
-  Message,
-  TextChannel,
-  ThreadChannel,
-} from "discord.js";
-import type { Adapter, MessageBus, ActorMessage } from "../types.ts";
+import { Client, GatewayIntentBits, Message, TextChannel, ThreadChannel } from "discord.js";
+import type { Attachment } from "discord.js";
+import { ensureDir } from "@std/fs";
+import { extname, join } from "@std/path";
+import type { ActorMessage, Adapter, ImportedAttachment, MessageBus } from "../types.ts";
 import type { Config } from "../config.ts";
 import { t } from "../i18n.ts";
 import { AuditLogger } from "../utils/audit-logger.ts";
 import { DiscordDiagnostics } from "../utils/discord-diagnostics.ts";
-import { 
-  withRetry, 
-  ConnectionStateManager, 
-  SessionPersistence 
+import {
+  ConnectionStateManager,
+  SessionPersistence,
+  withRetry,
 } from "../utils/resilient-connection.ts";
+
+const ATTACHMENTS_ENABLED = (Deno.env.get("CCDISCORD_ATTACH_ENABLE") ?? "true").toLowerCase() !==
+  "false";
+const MAX_TEXT_BYTES = parseEnvNumber("CCDISCORD_ATTACH_MAX_TEXT_BYTES", 1_000_000);
+const PREVIEW_BYTES = parseEnvNumber("CCDISCORD_ATTACH_INLINE_PREVIEW_BYTES", 8_000);
+const MAX_IMAGE_BYTES = parseEnvNumber("CCDISCORD_ATTACH_MAX_IMAGE_BYTES", 5_000_000);
+const IMAGE_PREVIEW_WIDTH = parseEnvNumber("CCDISCORD_ATTACH_IMAGE_PREVIEW_WIDTH", 512);
+const MAX_IMAGE_PREVIEW_BYTES = parseEnvNumber("CCDISCORD_ATTACH_MAX_PREVIEW_BYTES", 80_000);
+const IMAGE_PREVIEW_ENABLED = (Deno.env.get("CCDISCORD_ATTACH_IMAGE_PREVIEW_ENABLE") ??
+  "true").toLowerCase() !== "false";
+const ATTACH_BASE_DIR = Deno.env.get("CCDISCORD_ATTACH_BASEDIR");
+const DISCORD_CDN_REGEX = /^https:\/\/(cdn|media)\.discord(app)?\.com\//i;
+const TEXT_EXTENSIONS = new Set([
+  ".txt",
+  ".md",
+  ".markdown",
+  ".json",
+  ".yaml",
+  ".yml",
+  ".csv",
+  ".tsv",
+  ".py",
+  ".js",
+  ".ts",
+  ".tsx",
+  ".jsx",
+  ".html",
+  ".htm",
+  ".css",
+  ".scss",
+  ".c",
+  ".cc",
+  ".cpp",
+  ".h",
+  ".hpp",
+  ".java",
+  ".kt",
+  ".go",
+  ".rs",
+  ".rb",
+  ".php",
+  ".swift",
+  ".sql",
+  ".xml",
+  ".ini",
+  ".toml",
+  ".conf",
+  ".cfg",
+  ".sh",
+  ".bash",
+  ".zsh",
+  ".ps1",
+]);
+const IMAGE_EXTENSIONS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+]);
+
+function parseEnvNumber(key: string, fallback: number): number {
+  const raw = Deno.env.get(key);
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return parsed;
+}
+
+function extensionOf(filename: string): string {
+  const idx = filename.lastIndexOf(".");
+  return idx >= 0 ? filename.slice(idx).toLowerCase() : "";
+}
+
+function isLikelyText(filename: string, contentType?: string | null): boolean {
+  if (contentType) {
+    const lowered = contentType.toLowerCase();
+    if (lowered.startsWith("text/")) return true;
+    if (lowered.includes("json") || lowered.includes("xml") || lowered.includes("yaml")) {
+      return true;
+    }
+  }
+  return TEXT_EXTENSIONS.has(extensionOf(filename));
+}
+
+function isLikelyImage(filename: string, contentType?: string | null): boolean {
+  if (contentType) {
+    const lowered = contentType.toLowerCase();
+    if (lowered.startsWith("image/")) return true;
+  }
+  return IMAGE_EXTENSIONS.has(extensionOf(filename));
+}
+
+function sanitizeFilename(name: string): string {
+  const trimmed = name.trim() || "attachment";
+  const replaced = trimmed.replace(/[^\w.\-+@]+/g, "_");
+  return replaced.slice(0, 120) || "attachment";
+}
+
+function resolveAttachmentDir(channelId: string): string {
+  const base = ATTACH_BASE_DIR
+    ? (ATTACH_BASE_DIR.startsWith("/") ? ATTACH_BASE_DIR : join(Deno.cwd(), ATTACH_BASE_DIR))
+    : join(Deno.cwd(), "attachments");
+  return join(base, channelId);
+}
+
+function toDisplayPath(absolutePath: string): string {
+  const cwd = Deno.cwd();
+  if (absolutePath.startsWith(`${cwd}/`)) {
+    return absolutePath.slice(cwd.length + 1);
+  }
+  if (absolutePath.startsWith(`${cwd}\\`)) {
+    return absolutePath.slice(cwd.length + 1);
+  }
+  return absolutePath;
+}
+
+async function runCommand(command: string, args: string[]): Promise<boolean> {
+  try {
+    const cmd = new Deno.Command(command, {
+      args,
+      stdin: "null",
+      stdout: "null",
+      stderr: "null",
+    });
+    const { success } = await cmd.output();
+    return success;
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) {
+      return false;
+    }
+    console.warn(`[attachments] Command '${command}' failed`, error);
+    return false;
+  }
+}
+
+async function generateImagePreview(sourcePath: string): Promise<string | undefined> {
+  if (!IMAGE_PREVIEW_ENABLED) return undefined;
+
+  const ext = extname(sourcePath);
+  const previewPath = ext
+    ? `${sourcePath.slice(0, sourcePath.length - ext.length)}.preview${ext}`
+    : `${sourcePath}.preview`;
+
+  const attempts: Array<{ cmd: string; args: string[] }> = [
+    {
+      cmd: "magick",
+      args: [sourcePath, "-resize", `${IMAGE_PREVIEW_WIDTH}x${IMAGE_PREVIEW_WIDTH}>`, previewPath],
+    },
+    {
+      cmd: "convert",
+      args: [sourcePath, "-resize", `${IMAGE_PREVIEW_WIDTH}x${IMAGE_PREVIEW_WIDTH}>`, previewPath],
+    },
+    {
+      cmd: "sips",
+      args: ["-Z", String(IMAGE_PREVIEW_WIDTH), sourcePath, "--out", previewPath],
+    },
+  ];
+
+  for (const attempt of attempts) {
+    const ok = await runCommand(attempt.cmd, attempt.args);
+    if (!ok) {
+      continue;
+    }
+    try {
+      const info = await Deno.stat(previewPath);
+      if (info.size > MAX_IMAGE_PREVIEW_BYTES) {
+        console.warn(
+          `[attachments] Discarded preview at ${previewPath} (size ${info.size} bytes exceeds limit)`,
+        );
+        await Deno.remove(previewPath).catch(() => {});
+        continue;
+      }
+      return previewPath;
+    } catch (error) {
+      console.warn(`[attachments] Preview generation failed to stat ${previewPath}`, error);
+    }
+  }
+
+  // Clean up if preview file partially created
+  await Deno.remove(previewPath).catch(() => {});
+  return undefined;
+}
 
 // Adapter that manages Discord connection
 export class DiscordAdapter implements Adapter {
@@ -48,7 +227,7 @@ export class DiscordAdapter implements Adapter {
     this.messageBus = messageBus;
     this.auditLogger = new AuditLogger();
     this.connectionManager = new ConnectionStateManager();
-    
+
     // セッション永続化（continueオプション用）
     if (config.sessionId) {
       this.sessionPersistence = new SessionPersistence(config.sessionId);
@@ -74,14 +253,14 @@ export class DiscordAdapter implements Adapter {
 
     try {
       await this.auditLogger.init();
-      
+
       // 診断機能を有効化
       const enableDiagnostics = Deno.env.get("DISCORD_DIAGNOSTICS") !== "false";
       if (enableDiagnostics) {
         console.log(`[${this.name}] Diagnostics enabled`);
         this.diagnostics = new DiscordDiagnostics(this.client);
       }
-      
+
       await this.client.login(this.config.discordToken);
       this.isRunning = true;
       await this.auditLogger.logSessionStart(this.config.sessionId || "default", Deno.cwd());
@@ -148,7 +327,7 @@ export class DiscordAdapter implements Adapter {
           // Resume不可能な場合、ランダム待機後に再接続
           const waitTime = 1000 + Math.floor(Math.random() * 4000); // 1-5秒
           console.log(`[gw] Waiting ${waitTime}ms before reconnecting...`);
-          await new Promise(resolve => setTimeout(resolve, waitTime));
+          await new Promise((resolve) => setTimeout(resolve, waitTime));
 
           try {
             await this.client.destroy();
@@ -165,7 +344,7 @@ export class DiscordAdapter implements Adapter {
 
   private async handleReady(): Promise<void> {
     console.log(
-      `[${this.name}] ${t("discord.ready")} ${this.client.user?.tag}`
+      `[${this.name}] ${t("discord.ready")} ${this.client.user?.tag}`,
     );
 
     try {
@@ -193,7 +372,7 @@ export class DiscordAdapter implements Adapter {
       await withRetry(
         () => this.currentThread!.send(initialMessage),
         "thread.send.initial",
-        { maxRetries: 3, initialDelay: 1000 }
+        { maxRetries: 3, initialDelay: 1000 },
       );
 
       console.log(`[${this.name}] ${t("discord.threadCreated")} ${threadName}`);
@@ -207,14 +386,8 @@ export class DiscordAdapter implements Adapter {
 
 **${t("discord.sessionInfo.startTime")}**: ${new Date().toISOString()}
 **${t("discord.sessionInfo.workDir")}**: \`${Deno.cwd()}\`
-**${t("discord.sessionInfo.mode")}**: ${
-      this.config.debugMode ? "Debug" : "Production"
-    }
-${
-  this.config.neverSleep
-    ? `**${t("discord.sessionInfo.neverSleepEnabled")}**`
-    : ""
-}
+**${t("discord.sessionInfo.mode")}**: ${this.config.debugMode ? "Debug" : "Production"}
+${this.config.neverSleep ? `**${t("discord.sessionInfo.neverSleepEnabled")}**` : ""}
 
 ---
 
@@ -223,7 +396,133 @@ ${t("discord.instructions.header")}
 - \`!stop\`: ${t("discord.instructions.stop")}
 - \`!exit\`: ${t("discord.instructions.exit")}
 - \`!<command>\`: ${t("discord.instructions.shellCommand")}
+- \`!retry\`: 直前のリクエストを再実行します（使用制限解除後に便利です）
 - ${t("discord.instructions.normalMessage")}`;
+  }
+
+  private async collectAttachments(message: Message): Promise<ImportedAttachment[]> {
+    if (!ATTACHMENTS_ENABLED) return [];
+    const raw = message.attachments;
+    if (!raw || raw.size === 0) return [];
+
+    const collected: ImportedAttachment[] = [];
+    for (const attachment of raw.values()) {
+      try {
+        const saved = await this.saveAttachment(message.channel.id, attachment);
+        if (saved) collected.push(saved);
+      } catch (error) {
+        console.error(`[${this.name}] Failed to persist attachment`, error);
+      }
+    }
+    return collected;
+  }
+
+  private async saveAttachment(
+    channelId: string,
+    attachment: Attachment,
+  ): Promise<ImportedAttachment | null> {
+    const url = attachment.url ?? attachment.proxyURL ?? null;
+    if (!url || !DISCORD_CDN_REGEX.test(url)) {
+      return null;
+    }
+
+    const filename = attachment.name ?? "attachment";
+    const sanitized = sanitizeFilename(filename);
+    const contentType = attachment.contentType ?? undefined;
+    const isText = isLikelyText(filename, contentType ?? null);
+    const isImage = !isText && isLikelyImage(filename, contentType ?? null);
+    if (!isText && !isImage) {
+      console.warn(
+        `[${this.name}] Unsupported attachment skipped: ${filename} (${contentType ?? "unknown"})`,
+      );
+      return null;
+    }
+
+    const sizeHint = typeof attachment.size === "number" ? attachment.size : 0;
+    const sizeLimit = isText ? MAX_TEXT_BYTES : MAX_IMAGE_BYTES;
+    if (sizeHint && sizeHint > sizeLimit) {
+      console.warn(
+        `[${this.name}] Skipped attachment ${filename} (${sizeHint} bytes), exceeds limit ${sizeLimit}`,
+      );
+      return null;
+    }
+
+    const dir = resolveAttachmentDir(channelId);
+    await ensureDir(dir);
+    const storedPath = join(dir, `${Date.now()}_${sanitized}`);
+
+    const response = await fetch(url);
+    if (!response.ok || !response.body) {
+      throw new Error(`Attachment fetch failed with status ${response.status}`);
+    }
+
+    const file = await Deno.open(storedPath, { create: true, write: true });
+    const reader = response.body.getReader();
+    let totalBytes = 0;
+    const textChunks: Uint8Array[] = [];
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        totalBytes += value.byteLength;
+        if (totalBytes > sizeLimit) {
+          throw new Error(`attachment exceeds limit (${totalBytes} > ${sizeLimit})`);
+        }
+        await file.write(value);
+        if (isText) {
+          textChunks.push(value);
+        }
+      }
+    } catch (error) {
+      await Deno.remove(storedPath).catch(() => {});
+      throw error;
+    } finally {
+      file.close();
+    }
+
+    const displayPath = toDisplayPath(storedPath);
+
+    if (isText) {
+      const merged = new Uint8Array(Math.min(totalBytes, PREVIEW_BYTES));
+      let offset = 0;
+      for (const chunk of textChunks) {
+        if (offset >= merged.byteLength) break;
+        const slice = chunk.subarray(0, Math.max(0, merged.byteLength - offset));
+        merged.set(slice, offset);
+        offset += slice.byteLength;
+      }
+      const preview = new TextDecoder("utf-8", { fatal: false }).decode(merged);
+      return {
+        filename,
+        path: displayPath,
+        size: totalBytes,
+        contentType,
+        isText: true,
+        contentPreview: preview,
+      };
+    }
+
+    let previewPath: string | undefined;
+    if (IMAGE_PREVIEW_ENABLED) {
+      try {
+        const generated = await generateImagePreview(storedPath);
+        if (generated) {
+          previewPath = toDisplayPath(generated);
+        }
+      } catch (error) {
+        console.warn(`[${this.name}] Image preview generation failed for ${filename}`, error);
+      }
+    }
+
+    return {
+      filename,
+      path: displayPath,
+      size: totalBytes,
+      contentType,
+      isImage: true,
+      previewPath,
+    };
   }
 
   private async handleMessage(message: Message): Promise<void> {
@@ -231,8 +530,9 @@ ${t("discord.instructions.header")}
     if (message.author.bot) return;
 
     // Ignore messages outside current thread
-    if (!this.currentThread || message.channel.id !== this.currentThread.id)
+    if (!this.currentThread || message.channel.id !== this.currentThread.id) {
       return;
+    }
 
     // Check if user is allowed
     if (!this.isUserAllowed(message.author.id)) {
@@ -240,20 +540,47 @@ ${t("discord.instructions.header")}
       await this.auditLogger.logAuthFailure(message.author.id, message.channel.id);
       // Send warning message if user is not allowed
       await withRetry(
-        () => message.reply(t("discord.userNotAllowed") || "You are not authorized to use this bot."),
+        () =>
+          message.reply(t("discord.userNotAllowed") || "You are not authorized to use this bot."),
         "message.reply.auth",
-        { maxRetries: 2, initialDelay: 500 }
+        { maxRetries: 2, initialDelay: 500 },
       );
       return;
     }
 
     const content = message.content.trim();
-    if (!content) return;
+
+    if (content === "!retry") {
+      await this.messageBus.send({
+        id: message.id,
+        from: "discord",
+        to: "assistant",
+        type: "discord-command",
+        payload: {
+          text: content,
+          authorId: message.author.id,
+          channelId: message.channel.id,
+        },
+        timestamp: new Date(),
+      });
+      return;
+    }
+
+    let attachments: ImportedAttachment[] = [];
+    try {
+      attachments = await this.collectAttachments(message);
+    } catch (error) {
+      console.error(`[${this.name}] Attachment collection failed`, error);
+    }
+
+    const logSummary = content || (attachments.length > 0 ? "[attachments]" : "");
+
+    if (!logSummary) {
+      return;
+    }
 
     console.log(
-      `[${this.name}] ${t("discord.receivedMessage")} ${
-        message.author.username
-      }: ${content}`
+      `[${this.name}] ${t("discord.receivedMessage")} ${message.author.username}: ${logSummary}`,
     );
 
     // Log user message
@@ -261,7 +588,7 @@ ${t("discord.instructions.header")}
       message.author.id,
       message.author.username,
       message.channel.id,
-      content
+      logSummary,
     );
 
     // Convert Discord message to ActorMessage
@@ -274,6 +601,7 @@ ${t("discord.instructions.header")}
         text: content,
         authorId: message.author.id,
         channelId: message.channel.id,
+        attachments,
       },
       timestamp: new Date(),
     };
@@ -289,7 +617,7 @@ ${t("discord.instructions.header")}
 
   private async handleActorResponse(
     originalMessage: Message,
-    response: ActorMessage
+    response: ActorMessage,
   ): Promise<void> {
     // Handle system commands
     if (response.to === "system") {
@@ -303,30 +631,28 @@ ${t("discord.instructions.header")}
 
       if (assistantResponse) {
         // Filter out auto-responder messages if it's disabled
-        const autoResponderEnabled = 
-          Deno.env.get("ENABLE_AUTO_RESPONDER") === "true" ||
+        const autoResponderEnabled = Deno.env.get("ENABLE_AUTO_RESPONDER") === "true" ||
           Deno.env.get("NEVER_SLEEP") === "true";
-        
+
         if (assistantResponse.from === "auto-responder" && !autoResponderEnabled) {
           console.log(`[${this.name}] Filtered auto-responder message (disabled)`);
           return;
         }
-        
+
         // Filter out Claude Code's "Todos" tool output noise
         const payload: any = assistantResponse.payload ?? {};
         const txt = (payload.text ?? "").toString();
         const toolName = payload.toolName || payload.tool || "";
-        const looksLikeTodos =
-          /Todos have been modified successfully/i.test(txt) ||
+        const looksLikeTodos = /Todos have been modified successfully/i.test(txt) ||
           /continue to use the todo list/i.test(txt) ||
           /ensure that you continue to use the todo list/i.test(txt) ||
           /^Todos$/i.test(toolName);
-        
+
         if (looksLikeTodos) {
           console.log(`[${this.name}] Suppressed Todos tool output`);
           return;
         }
-        
+
         const text = (assistantResponse.payload as { text?: string })?.text;
         if (text) {
           // Avoid duplicate final send if streaming path already handled completion
@@ -346,7 +672,7 @@ ${t("discord.instructions.header")}
 
   private async handleSystemCommand(
     message: Message,
-    response: ActorMessage
+    response: ActorMessage,
   ): Promise<void> {
     const channel = message.channel as TextChannel | ThreadChannel;
 
@@ -357,7 +683,7 @@ ${t("discord.instructions.header")}
         await withRetry(
           () => channel.send(t("discord.commands.resetComplete")),
           "channel.send.reset",
-          { maxRetries: 3, initialDelay: 1000 }
+          { maxRetries: 3, initialDelay: 1000 },
         );
         break;
 
@@ -365,7 +691,7 @@ ${t("discord.instructions.header")}
         await withRetry(
           () => channel.send(t("discord.commands.stopComplete")),
           "channel.send.stop",
-          { maxRetries: 3, initialDelay: 1000 }
+          { maxRetries: 3, initialDelay: 1000 },
         );
         break;
 
@@ -373,7 +699,7 @@ ${t("discord.instructions.header")}
         await withRetry(
           () => channel.send(t("discord.commands.exitMessage")),
           "channel.send.exit",
-          { maxRetries: 2, initialDelay: 500 }
+          { maxRetries: 2, initialDelay: 500 },
         );
         await this.stop();
         Deno.exit(0);
@@ -386,11 +712,12 @@ ${t("discord.instructions.header")}
         // - Run commands in a sandboxed environment
         // - Log all command executions for audit purposes
         await withRetry(
-          () => channel.send(
-            "⚠️ Shell command execution is disabled for security reasons."
-          ),
+          () =>
+            channel.send(
+              "⚠️ Shell command execution is disabled for security reasons.",
+            ),
           "channel.send.shell-warning",
-          { maxRetries: 2, initialDelay: 500 }
+          { maxRetries: 2, initialDelay: 500 },
         );
         break;
     }
@@ -398,7 +725,7 @@ ${t("discord.instructions.header")}
 
   private async sendLongMessage(
     message: Message,
-    content: string
+    content: string,
   ): Promise<void> {
     const channel = message.channel as TextChannel | ThreadChannel;
     const messages: string[] = [];
@@ -422,14 +749,14 @@ ${t("discord.instructions.header")}
         await withRetry(
           () => channel.send(msg),
           "channel.send.long-message",
-          { maxRetries: 3, initialDelay: 1000 }
+          { maxRetries: 3, initialDelay: 1000 },
         );
         // Wait a bit to avoid rate limiting
         await new Promise((resolve) => setTimeout(resolve, 1000));
       } catch (error) {
         console.error(
           `[${this.name}] ${t("discord.failedSendMessage")}`,
-          error
+          error,
         );
       }
     }
@@ -464,8 +791,9 @@ ${t("discord.instructions.header")}
       type !== "stream-partial" &&
       type !== "stream-completed" &&
       type !== "stream-error"
-    )
+    ) {
       return;
+    }
 
     const cfg = this.getStreamingConfig();
     if (!cfg.enabled) return;
@@ -478,8 +806,9 @@ ${t("discord.instructions.header")}
     if (
       !this.currentThread ||
       (channelId && this.currentThread.id !== channelId)
-    )
+    ) {
       return;
+    }
     if (!id) return;
 
     switch (type) {
@@ -493,11 +822,7 @@ ${t("discord.instructions.header")}
         void this.onStreamCompleted(id, channelId, payload?.fullText ?? "");
         break;
       case "stream-error":
-        void this.onStreamError(
-          id,
-          channelId,
-          payload?.message ?? "Unknown error"
-        );
+        void this.onStreamError(id, channelId, payload ?? {});
         break;
     }
   }
@@ -505,7 +830,7 @@ ${t("discord.instructions.header")}
   private async onStreamStarted(
     id: string,
     channelId?: string,
-    _meta?: any
+    _meta?: any,
   ): Promise<void> {
     const cfg = this.getStreamingConfig();
     const state = {
@@ -521,7 +846,7 @@ ${t("discord.instructions.header")}
         const msg = await withRetry(
           () => this.currentThread!.send("🤔 考え中..."),
           "thread.send.thinking",
-          { maxRetries: 2, initialDelay: 500 }
+          { maxRetries: 2, initialDelay: 500 },
         );
         state.thinkingMessage = msg;
       } catch (e) {
@@ -545,9 +870,7 @@ ${t("discord.instructions.header")}
   private async flushNow(id: string): Promise<void> {
     const st = this.streamStates.get(id);
     if (!st || !this.currentThread) return;
-    const out = `${st.toolBuffer}${st.toolBuffer && st.buffer ? "\n" : ""}${
-      st.buffer
-    }`.trim();
+    const out = `${st.toolBuffer}${st.toolBuffer && st.buffer ? "\n" : ""}${st.buffer}`.trim();
     if (!out) return;
 
     try {
@@ -555,14 +878,14 @@ ${t("discord.instructions.header")}
         await withRetry(
           () => st.thinkingMessage!.edit(this.capContent(out)),
           "message.edit.stream",
-          { maxRetries: 3, initialDelay: 1000 }
+          { maxRetries: 3, initialDelay: 1000 },
         );
       } else {
         // append mode or no thinking message available
         await withRetry(
           () => this.currentThread!.send(this.capContent(out)),
           "thread.send.stream",
-          { maxRetries: 3, initialDelay: 1000 }
+          { maxRetries: 3, initialDelay: 1000 },
         );
       }
     } catch (e) {
@@ -576,7 +899,7 @@ ${t("discord.instructions.header")}
   private async onStreamPartial(
     id: string,
     _channelId: string | undefined,
-    payload: any
+    payload: any,
   ): Promise<void> {
     const st = this.streamStates.get(id);
     if (!st) {
@@ -621,14 +944,14 @@ ${t("discord.instructions.header")}
         await withRetry(
           () => this.currentThread!.send(msg),
           "thread.send.completed",
-          { maxRetries: 3, initialDelay: 1000 }
+          { maxRetries: 3, initialDelay: 1000 },
         );
         // Wait to avoid rate limiting (keep parity with sendLongMessage)
         await new Promise((resolve) => setTimeout(resolve, 1000));
       } catch (error) {
         console.error(
           `[${this.name}] ${t("discord.failedSendMessage")}`,
-          error
+          error,
         );
       }
     }
@@ -637,7 +960,7 @@ ${t("discord.instructions.header")}
   private async onStreamCompleted(
     id: string,
     _channelId: string | undefined,
-    fullText: string
+    fullText: string,
   ): Promise<void> {
     const st = this.streamStates.get(id);
     if (st?.timer) {
@@ -668,7 +991,7 @@ ${t("discord.instructions.header")}
         await withRetry(
           () => this.currentThread!.send("✅ done"),
           "thread.send.done",
-          { maxRetries: 2, initialDelay: 500 }
+          { maxRetries: 2, initialDelay: 500 },
         );
       }
     } catch (e) {
@@ -684,7 +1007,7 @@ ${t("discord.instructions.header")}
   private async onStreamError(
     id: string,
     _channelId: string | undefined,
-    message: string
+    payload: { message?: string; fatal?: boolean },
   ): Promise<void> {
     const st = this.streamStates.get(id);
     if (st?.timer) {
@@ -702,11 +1025,17 @@ ${t("discord.instructions.header")}
     const cfg = this.getStreamingConfig();
     if (cfg.showAbort && this.currentThread) {
       try {
-        await withRetry(
-          () => this.currentThread!.send(`⚠️ ストリーミング中断: ${message}`),
-          "thread.send.abort",
-          { maxRetries: 2, initialDelay: 500 }
-        );
+        const fatal = payload?.fatal !== false;
+        const text = fatal
+          ? `⚠️ ストリーミング中断: ${payload?.message ?? "Unknown error"}`
+          : payload?.message ?? "";
+        if (text) {
+          await withRetry(
+            () => this.currentThread!.send(text),
+            "thread.send.abort",
+            { maxRetries: 2, initialDelay: 500 },
+          );
+        }
       } catch {
         // ignore
       }
